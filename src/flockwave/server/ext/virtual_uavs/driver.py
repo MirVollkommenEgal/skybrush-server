@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from colour import Color
 from enum import Enum
 from hashlib import sha1 as firmware_hash
@@ -91,6 +92,7 @@ class VirtualUAV(UAVBase):
     _parameters: dict[str, str]
     _position_xyz: Vector3D
     _position_flat: FlatEarthCoordinate
+    _pyro_triggered: defaultdict[int, bool]
     _request_shutdown: Optional[Callable[[], None]]
     _shutdown_reason: Optional[str]
     _trajectory_transformation: Optional[FlatEarthToGPSCoordinateTransformation]
@@ -171,6 +173,7 @@ class VirtualUAV(UAVBase):
         self._parameters = {}
         self._position_xyz = Vector3D()
         self._position_flat = FlatEarthCoordinate()
+        self._pyro_triggered = defaultdict(bool)
         self._state = None  # type: ignore
         self._target_xyz = None
         self._trajectory = None
@@ -457,6 +460,8 @@ class VirtualUAV(UAVBase):
                 yield Progress(
                     percentage=int((index + 1) * (100 / len(color_sequence)))
                 )
+        elif component == "pyro":
+            self.trigger_pyro(channel=0)
         else:
             raise NotSupportedError
 
@@ -863,6 +868,10 @@ class VirtualUAV(UAVBase):
 
         self.state = VirtualUAVState.TAKEOFF
 
+    def trigger_pyro(self, channel: int) -> None:
+        """Triggers the pyro attached to the given channel of the virtual UAV."""
+        self._pyro_triggered[channel] = True
+
     def _initialize_device_tree_node(self, node: ObjectNode) -> None:
         self.battery = VirtualBattery(report_percentage=self.use_battery_percentage)
         self.battery.register_in_device_tree(node)
@@ -1081,7 +1090,7 @@ class VirtualUAVDriver(UAVDriver[VirtualUAV]):
 
         yield "Result."
 
-    handle_command_test = create_test_command_handler(("motor", "led"))
+    handle_command_test = create_test_command_handler(("motor", "led", "pyro"))
 
     async def handle_command_timeout(self, uav: VirtualUAV) -> None:
         """Dummy command that does not respond in a reasonable amount of time.

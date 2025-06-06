@@ -18,6 +18,7 @@ STANDARD_COMPONENTS = {
     "gyro": "Gyroscope",
     "led": "LED",
     "motor": "Motor",
+    "pyro": "Pyro",
 }
 
 

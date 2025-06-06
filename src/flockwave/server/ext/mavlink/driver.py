@@ -297,7 +297,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
     handle_command_param = create_parameter_command_handler(
         name_validator=to_uppercase_string
     )
-    handle_command_test = create_test_command_handler(("motor", "led"))
+    handle_command_test = create_test_command_handler(("motor", "led", "pyro"))
     handle_command_version = create_version_command_handler()
 
     async def handle_command_mode(self, uav: "MAVLinkUAV", mode: Optional[str] = None):
@@ -1525,6 +1525,8 @@ class MAVLinkUAV(UAVBase):
                 if index > 0:
                     await sleep(1)
                 await self.set_led_color(color, channel=channel, duration=2)
+        elif component == "pyro":
+            await self.trigger_pyro(channel=0)
         else:
             raise NotSupportedError
 
@@ -2096,6 +2098,14 @@ class MAVLinkUAV(UAVBase):
                     f"Failed to reset data stream rate(s) for message(s) {message}",
                     extra={"id": log_id_for_uav(self)},
                 )
+
+    async def trigger_pyro(self, channel: int) -> None:
+        """Triggers the pyro attached to the given channel of the UAV.
+
+        Args:
+            channel: the zero-based channel index the pyro should be triggered at
+        """
+        raise NotImplementedError("TODO: implement pyro triggering")
 
     async def upload_show(self, show) -> None:
         coordinate_system = get_coordinate_system_from_show_specification(show)
