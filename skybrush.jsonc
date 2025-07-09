@@ -1,0 +1,29 @@
+{
+    "EXTENSIONS": {
+        // Make the server listen on all network interfaces
+        "http_server": {
+            "host": ""
+        },
+        "location": {
+            "fixed": {
+                "position": [
+                    52.400000,
+                    13.060000,
+                    40.0
+                ],
+                "accuracy": 1
+            }
+        },
+        // RTK extension configuration
+        "rtk": {
+            "enabled": true,
+            "presets": {
+                "NTRIPConnection": {
+                    "source": Philipp_SAPOS_BB,
+                    "title": "Example NTRIP provider",
+                    "format": "auto",
+                },
+            }
+        }
+    }
+}
