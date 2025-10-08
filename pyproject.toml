@@ -1,6 +1,6 @@
 [project]
 name = "flockwave-server"
-version = "2.36.0"
+version = "2.33.1"
 description = "Skybrush server component"
 authors = [
   { name = "Tamas Nepusz", email = "tamas@collmot.com" },
@@ -32,7 +32,7 @@ dependencies = [
   "flockwave-mavlink>=0.5.1",
   "flockwave-net[async]>=8.1.0",
   "flockwave-parsers>=4.0.1",
-  "flockwave-spec[validation]>=2.4.0",
+  "flockwave-spec[validation]>=2.3.0",
   "pyledctrl>=4.1.0",
   "aiocflib>=4.1.0",
   "crcmod-plus>=2.1.0",
@@ -50,7 +50,6 @@ dependencies = [
   "platformdirs>=4.3.8",
   "fastjsonschema>=2.21.1",
   "orjson>=3.10.18",
-  "skynet>=0.4.1",
 ]
 
 [project.scripts]
@@ -58,26 +57,6 @@ skybrushd = "flockwave.server.launcher:start"
 skybrush-gateway = "flockwave.gateway.launcher:start"
 skybrush-proxy = "flockwave.proxy.launcher:start"
 
-[project.optional-dependencies]
-all = ["flockwave-server[collmot,pro]"]
-collmot = [
-  "flockwave-server[pro]",
-  "flockwave-flockctrl>=4.0.0",
-  "skybrush-ext-dock>=1.2.0",
-  "skybrush-ext-flockctrl>=4.0.3",
-]
-pro = [
-  "skybrush-ext-firmware-update>=0.5.0",
-  "skybrush-ext-flight-report>=1.0.3",
-  "skybrush-ext-map-cache>=1.1.1",
-  "skybrush-ext-show-pro>=0.4.0",
-  "skybrush-ext-sidekick>=1.0.2",
-  "skybrush-ext-skynet>=0.4.1",
-  "skybrush-ext-studio>=0.8.6",
-  "skybrush-ext-timecode>=1.4.1",
-  "skybrush-lib-mission-planning>=2.4.1",
-  "skybrush-studio>=4.24.2",
-]
 
 [tool.uv.build-backend]
 module-name = "flockwave"
@@ -105,19 +84,16 @@ flockwave-mavlink = { index = "fury" }
 flockwave-net = { index = "fury" }
 flockwave-parsers = { index = "fury" }
 flockwave-spec = { index = "fury" }
-skybrush-ext-dock = { index = "collmot" }
 skybrush-ext-firmware-update = { index = "collmot" }
 skybrush-ext-flight-report = { index = "collmot" }
 skybrush-ext-flockctrl = { index = "collmot" }
 skybrush-ext-map-cache = { index = "collmot" }
 skybrush-ext-show-pro = { index = "collmot" }
-skybrush-ext-skynet = { index = "collmot" }
 skybrush-ext-sidekick = { index = "collmot" }
 skybrush-ext-studio = { index = "collmot" }
 skybrush-ext-timecode = { index = "collmot" }
 skybrush-lib-mission-planning = { index = "collmot" }
 skybrush-studio = { index = "collmot" }
-skynet = { index = "collmot" }
 pyledctrl = { index = "fury" }
 
 [dependency-groups]
@@ -129,7 +105,6 @@ dev = [
   "pytest-cov>=6.2.1",
   "pytest-trio>=0.8.0",
   "pdoc>=15.0.4",
-  "pytest-datadir>=1.8.0",
 ]
 
 [tool.pytest.ini_options]
