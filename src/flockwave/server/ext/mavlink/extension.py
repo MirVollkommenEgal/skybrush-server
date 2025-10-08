@@ -7,8 +7,15 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 from functools import partial
-from logging import Logger
-from typing import Iterator, cast, Optional, TYPE_CHECKING
+from typing import (
+    Any,
+    Callable,
+    Iterator,
+    cast,
+    Optional,
+    TYPE_CHECKING,
+    overload,
+)
 
 from flockwave.server.ext.base import UAVExtension
 from flockwave.server.ext.mavlink.fw_upload import FirmwareUpdateTarget
@@ -16,8 +23,8 @@ from flockwave.server.model.uav import UAV
 from flockwave.server.registries.errors import RegistryFull
 from flockwave.server.utils import optional_int, overridden
 
+from .autopilots import ArduPilot, ArduPilotWithSkybrush, PX4, Autopilot
 from .driver import MAVLinkDriver, MAVLinkUAV
-from .enums import MAVSeverity
 from .errors import InvalidSigningKeyError
 from .network import MAVLinkNetwork
 from .rssi import RSSIMode
@@ -32,12 +39,10 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from flockwave.server.app import SkybrushServer
     from flockwave.server.ext.rc import RCState
     from flockwave.server.ext.show.clock import ShowClock
     from flockwave.server.ext.show.config import DroneShowConfiguration
-
-__all__ = ("construct", "dependencies")
+    from flockwave.server.tasks.led_lights import LightConfiguration
 
 
 #: Dictionary that resolves common connection preset aliases used in
@@ -55,9 +60,6 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
     """Extension that adds support for drone flocks using the MAVLink
     protocol.
     """
-
-    app: "SkybrushServer"
-    log: Logger
 
     _networks: dict[str, MAVLinkNetwork]
     """Dictionary mapping network IDs to the MAVLink networks managed by this
@@ -88,12 +90,66 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
             configuration (dict): the configuration dictionary of the
                 extension
         """
+        assert self.log is not None
+
+        assume_data_streams_configured = bool(
+            configuration.get("assume_data_streams_configured")
+        )
+        if assume_data_streams_configured:
+            self.log.info("MAVLink data streams are assumed to be configured")
+
+        autopilot_type = str(configuration.get("autopilot_type", "auto")) or "auto"
+        autopilot_factory: Optional[Callable[[], Autopilot]]
+        match autopilot_type:
+            case "auto":
+                autopilot_factory = None
+            case "ardupilot":
+                autopilot_factory = ArduPilot
+                self.log.info("Flight controller firmware: ArduPilot")
+            case "px4":
+                autopilot_factory = PX4
+                self.log.info("Flight controller firmware: PX4")
+            case "skybrush":
+                autopilot_factory = ArduPilotWithSkybrush
+                self.log.info("Flight controller firmware: Skybrush on ArduPilot")
+            case _:
+                autopilot_factory = None
+                self.log.warning(
+                    f'Unknown flight controller firmware: {autopilot_type}, assuming "auto"'
+                )
+
+        use_bulk_parameter_uploads = bool(
+            configuration.get("use_bulk_parameter_uploads", False)
+        )
+        if use_bulk_parameter_uploads:
+            self.log.info("Using bulk parameter uploads (experimental)")
+
+        driver.assume_data_streams_configured = assume_data_streams_configured
+        driver.autopilot_factory = autopilot_factory
         driver.broadcast_packet = self._broadcast_packet
         driver.create_device_tree_mutator = self.create_device_tree_mutation_context
         driver.log = self.log
         driver.mandatory_custom_mode = optional_int(configuration.get("custom_mode"))
         driver.run_in_background = self.run_in_background
         driver.send_packet = self._send_packet
+        driver.use_bulk_parameter_uploads = use_bulk_parameter_uploads
+
+    def exports(self) -> dict[str, Any]:
+        return {
+            "find_network_by_id": self._find_network_by_id,
+        }
+
+    def _find_network_by_id(self, network_id: str) -> Optional[MAVLinkNetwork]:
+        """Finds a MAVLink network managed by this extension by its ID.
+
+        Parameters:
+            network_id: the ID of the network to find
+
+        Returns:
+            the MAVLink network with the given ID, or `None` if no such
+            network exists
+        """
+        return self._networks.get(network_id)
 
     async def run(self, app, configuration):
         networks = OrderedDict(
@@ -213,6 +269,8 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
     def _get_network_specifications_from_configuration(
         self, configuration
     ) -> dict[str, MAVLinkNetworkSpecification]:
+        assert self.log is not None
+
         # Construct the network specifications first
         if "networks" in configuration:
             if "connections" in configuration:
@@ -367,7 +425,9 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         # Send the configuration to all the networks
         self._update_show_configuration_in_networks(config)
 
-    def _on_show_light_configuration_changed(self, sender, config) -> None:
+    def _on_show_light_configuration_changed(
+        self, sender, config: LightConfiguration
+    ) -> None:
         """Handler that is called when the user changes the LED light configuration
         of the drones in the `show` extesion.
         """
@@ -386,6 +446,8 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         in a manner that ensures that the UAV is unregistered when the extension
         is stopped.
         """
+        assert self.app is not None
+
         if self._uavs is None:
             raise RuntimeError("cannot register a UAV before the extension is started")
 
@@ -398,19 +460,50 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
 
         self._uavs.append(uav)
 
+    @overload
     async def _send_packet(
         self,
         spec: MAVLinkMessageSpecification,
         target: MAVLinkUAV,
-        wait_for_response: Optional[MAVLinkMessageSpecification] = None,
-        wait_for_one_of: Optional[dict[str, MAVLinkMessageMatcher]] = None,
+        *,
         channel: Optional[str] = None,
-    ) -> Optional[MAVLinkMessage]:
+    ) -> None: ...
+
+    @overload
+    async def _send_packet(
+        self,
+        spec: Optional[MAVLinkMessageSpecification],
+        target: MAVLinkUAV,
+        *,
+        wait_for_response: tuple[str, MAVLinkMessageMatcher],
+        channel: Optional[str] = None,
+    ) -> MAVLinkMessage: ...
+
+    @overload
+    async def _send_packet(
+        self,
+        spec: Optional[MAVLinkMessageSpecification],
+        target: MAVLinkUAV,
+        *,
+        wait_for_one_of: dict[str, MAVLinkMessageSpecification],
+        channel: Optional[str] = None,
+    ) -> tuple[str, MAVLinkMessage]: ...
+
+    async def _send_packet(
+        self,
+        spec: Optional[MAVLinkMessageSpecification],
+        target: MAVLinkUAV,
+        *,
+        wait_for_response: Optional[tuple[str, MAVLinkMessageMatcher]] = None,
+        wait_for_one_of: Optional[dict[str, MAVLinkMessageSpecification]] = None,
+        channel: Optional[str] = None,
+    ):
         """Sends a message to the given UAV and optionally waits for a matching
         response.
 
         Parameters:
-            spec: the specification of the MAVLink message to send
+            spec: the specification of the MAVLink message to send; ``None`` if
+                no packet needs to be sent and we only need to wait for a reply
             target: the UAV to send the message to
             wait_for_response: when not `None`, specifies a MAVLink message to
                 wait for as a response. The message specification will be
@@ -422,13 +515,23 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 UAV where this message was sent.
             channel: specifies the channel that the packet should be sent on;
                 defaults to the preferred channel of the network
+
+        Returns:
+            ``None`` if `wait_for_response` and `wait_for_one_of` are both
+            ``None``; the received response if `wait_for_response` was not
+            ``None``; the key of the matched message specification and the
+            message itself if `wait_for_one_of` was not ``None``.
         """
         if not self._networks:
             raise RuntimeError("Cannot send packet; extension is not running")
 
         network = self._networks[target.network_id]
         return await network.send_packet(
-            spec, target, wait_for_response, wait_for_one_of, channel
+            spec,
+            target,
+            wait_for_response=wait_for_response,
+            wait_for_one_of=wait_for_one_of,
+            channel=channel,
         )
 
     def _update_show_configuration_in_networks(
@@ -439,6 +542,9 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         the configuration object is `None`, retrieves it from the `show`
         extension itself.
         """
+        assert self.app is not None
+        assert self.log is not None
+
         if config is None:
             config = self.app.import_api("show").get_configuration()
 
@@ -454,6 +560,9 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         """Updates the scheduled start times of the drones managed by this
         extension, based on the start time extracted from the show clock.
         """
+        assert self.app is not None
+        assert self.log is not None
+
         clock = cast(Optional["ShowClock"], self.app.import_api("show").get_clock())
         if not clock:
             return
@@ -466,14 +575,22 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                     f"Failed to update start time of drones in network {name!r}"
                 )
 
-    def _update_show_light_configuration_in_networks(self, config=None) -> None:
+    def _update_show_light_configuration_in_networks(
+        self, config: LightConfiguration | None = None
+    ) -> None:
         """Updates the current LED light settings of the drones managed by this
         extension, based on the given configuration object from the `show`
         extension. If the configuration object is `None`, retrieves it from the
         `show` extension itself.
         """
+        assert self.app is not None
+        assert self.log is not None
+
         if config is None:
-            config = self.app.import_api("show").get_light_configuration()
+            config = cast(
+                "LightConfiguration",
+                self.app.import_api("show").get_light_configuration(),
+            )
 
         for name, network in self._networks.items():
             try:
@@ -482,231 +599,3 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 self.log.warning(
                     f"Failed to update LED light configuration of drones in network {name!r}"
                 )
-
-
-RSSI_MODE_SCHEMA = {
-    "type": "string",
-    "enum": [
-        RSSIMode.NONE.value,
-        RSSIMode.RADIO_STATUS.value,
-        RSSIMode.RTCM_COUNTERS.value,
-    ],
-    "title": "RSSI mode",
-    "default": RSSIMode.RADIO_STATUS.value,
-    "options": {
-        "enum_titles": [
-            "No RSSI values",
-            "From RADIO_STATUS messages",
-            "From RTCM counters (Skybrush only)",
-        ]
-    },
-}
-
-construct = MAVLinkDronesExtension
-dependencies = ("show", "signals")
-description = "Support for drones that use the MAVLink protocol"
-enhancers = {"firmware_update": MAVLinkDronesExtension.use_firmware_update_support}
-schema = {
-    "properties": {
-        "networks": {
-            "title": "MAVLink networks",
-            "type": "object",
-            "propertyOrder": 2000,
-            "options": {"disable_properties": False},
-            "additionalProperties": {
-                "type": "object",
-                "properties": {
-                    "connections": {
-                        "title": "Connection URLs",
-                        "type": "array",
-                        "format": "table",
-                        "items": {"type": "string"},
-                        "default": [],
-                        "description": (
-                            "URLs describing the connections where the server needs to "
-                            "listen for incoming MAVLink packets in this network. 'default' "
-                            "means that incoming MAVLink packets are expected on UDP port "
-                            "14550 and outbound MAVLink packets are sent to UDP port 14555."
-                        ),
-                    },
-                    "id_format": {
-                        "type": "string",
-                        "title": "ID format",
-                        "description": (
-                            "Python format string that determines the format of the IDs of "
-                            "the drones created in this network. Overrides the global ID format "
-                            "defined at the top level."
-                        ),
-                    },
-                    "id_offset": {
-                        "type": "number",
-                        "title": "ID offset",
-                        "default": 0,
-                        "description": (
-                            "Offset to add to the numeric ID of each drone within the network "
-                            "to derive its final ID. You can use it to map multiple networks "
-                            "with the same MAVLink ID range to different Skybrush ID ranges. "
-                            "Leave it at zero if you only have one MAVLink network."
-                        ),
-                    },
-                    "system_id": {
-                        "title": "System ID",
-                        "description": (
-                            "MAVLink system ID of the server in this network; typically "
-                            "IDs from 251 to 254 are reserved for ground stations."
-                        ),
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 255,
-                        "default": 254,
-                    },
-                    "routing": {
-                        "type": "object",
-                        "title": "Message routing",
-                        "properties": {
-                            "rc": {
-                                "type": "array",
-                                "format": "table",
-                                "title": "RC override",
-                                "description": "Indices of the connections where RC override messages are routed to (zero-based)",
-                                "default": [0],
-                                "items": {
-                                    "type": "integer",
-                                    "default": 0,
-                                    "minimum": 0,
-                                },
-                            },
-                            "rtk": {
-                                "type": "array",
-                                "format": "table",
-                                "title": "RTK messages",
-                                "description": "Indices of the connection where RTK correction messages are routed to (zero-based)",
-                                "default": [0],
-                                "items": {
-                                    "type": "integer",
-                                    "default": 0,
-                                    "minimum": 0,
-                                },
-                            },
-                        },
-                    },
-                    "rssi_mode": dict(
-                        RSSI_MODE_SCHEMA,
-                        description="Specifies how RSSI values are derived for the drones in this network",
-                    ),
-                    "signing": {
-                        "type": "object",
-                        "title": "Message signing",
-                        "properties": {
-                            "enabled": {
-                                "type": "boolean",
-                                "title": "Enable MAVLink message signing",
-                                "default": False,
-                                "format": "checkbox",
-                                "propertyOrder": -1000,
-                            },
-                            "key": {
-                                "type": "string",
-                                "title": "Signing key",
-                                "default": "",
-                                "description": (
-                                    "The key must be exactly 32 bytes long. It can be "
-                                    "provided in hexadecimal format or as a base64-encoded "
-                                    "string, which is identical to the format being used "
-                                    "in Mission Planner."
-                                ),
-                                "propertyOrder": -500,
-                            },
-                            "sign_outbound": {
-                                "type": "boolean",
-                                "title": "Sign outbound MAVLink messages if signing is enabled",
-                                "default": True,
-                                "format": "checkbox",
-                            },
-                            "allow_unsigned": {
-                                "type": "boolean",
-                                "title": "Accept unsigned incoming messages",
-                                "default": False,
-                                "format": "checkbox",
-                            },
-                        },
-                    },
-                    "statustext_targets": {
-                        "type": "object",
-                        "title": "STATUSTEXT message handling",
-                        "properties": {
-                            "client": MAVSeverity.json_schema(
-                                title="Forward to Skybrush clients above this severity",
-                            ),
-                            "server": MAVSeverity.json_schema(
-                                title="Log in the server log above this severity",
-                            ),
-                            "log_prearm": {
-                                "type": "boolean",
-                                "title": "Log pre-arm messages",
-                                "description": (
-                                    "If enabled, the extension will log all pre-arm check "
-                                    "errors received from the drones in this network. "
-                                    "These messages are hidden by default as they are "
-                                    "fairly common and can be inspected by other means."
-                                ),
-                                "default": False,
-                                "format": "checkbox",
-                                "propertyOrder": 10000,
-                            },
-                        },
-                        "default": {
-                            "client": "debug",
-                            "server": "notice",
-                            "log_prearm": False,
-                        },
-                    },
-                    "use_broadcast_rate_limiting": {
-                        "type": "boolean",
-                        "title": "Apply rate limiting on broadcast messages",
-                        "description": (
-                            "This is a workaround that should be enabled only if "
-                            "you have a connection without flow control and you "
-                            "are experiencing issues with packet loss, especially "
-                            "for bursty packet streams like RTK corrections."
-                        ),
-                        "default": False,
-                        "format": "checkbox",
-                    },
-                },
-            },
-        },
-        "id_format": {
-            "type": "string",
-            "title": "ID format",
-            "description": (
-                "Python format string that determines the format of the IDs of "
-                "the drones created by the extension. May be overridden in each "
-                "network."
-            ),
-            "propertyOrder": 0,
-        },
-        "custom_mode": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 255,
-            "required": False,
-            "title": "Enforce MAVLink custom flight mode",
-            "description": (
-                "MAVLink custom flight mode number to switch drones to when "
-                "they are discovered the first time. 127 is the mode number of "
-                "the drone show mode for Skybrush-compatible MAVLink-based "
-                "drones. Refer to the documentation of your autopilot for more "
-                "details."
-            ),
-            "default": 127,
-            "propertyOrder": 5000,
-        },
-        "rssi_mode": dict(
-            RSSI_MODE_SCHEMA,
-            description="Specifies how RSSI values are derived for the drones. May be overridden in each network.",
-            propertyOrder=10000,
-        ),
-        # packet_loss is an advanced setting and is not included here
-    }
-}

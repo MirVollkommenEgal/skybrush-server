@@ -22,7 +22,7 @@ from trio import (
     open_nursery,
     SocketStream,
 )
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Generic, Optional, TYPE_CHECKING, TypeVar
 
 from flockwave.channels import ParserChannel
 from flockwave.encoders.json import create_json_encoder
@@ -40,12 +40,15 @@ app: Optional[SkybrushServer] = None
 encoder = create_json_encoder()
 log: Optional[Logger] = None
 
+T = TypeVar("T")
 
-class TCPChannel(CommunicationChannel):
+
+class TCPChannel(Generic[T], CommunicationChannel[T]):
     """Object that represents a TCP communication channel between a
     server and a single client.
     """
 
+    address: Optional[tuple[str, int]]
     client_ref: Optional["weakref.ref[Client]"]
     lock: Lock
 
@@ -60,7 +63,7 @@ class TCPChannel(CommunicationChannel):
         """Binds the communication channel to the given client.
 
         Parameters:
-            client (Client): the client to bind the channel to
+            client: the client to bind the channel to
         """
         if client.id and client.id.startswith("tcp://"):
             host, _, port = client.id[6:].rpartition(":")
@@ -83,7 +86,7 @@ class TCPChannel(CommunicationChannel):
         else:
             await self.stream.aclose()
 
-    async def send(self, message):
+    async def send(self, message: T):
         """Inherited."""
         if self.stream is None:
             self.stream = self.client_ref().stream
@@ -103,7 +106,7 @@ class TCPChannel(CommunicationChannel):
 ############################################################################
 
 
-def get_address(in_subnet_of: Optional[str] = None) -> str:
+def get_address(in_subnet_of: Optional[str] = None) -> tuple[str, int]:
     """Returns the address where we are listening for incoming TCP connections.
 
     Parameters:
@@ -131,7 +134,7 @@ def get_ssdp_location(address, host, port) -> Optional[str]:
     )
 
 
-async def handle_connection(stream, *, limit):
+async def handle_connection(stream: SocketStream, *, limit: CapacityLimiter):
     """Handles a connection attempt from a single client.
 
     Parameters:
@@ -200,11 +203,11 @@ async def handle_message(message: Any, client, *, limit: CapacityLimiter) -> Non
 ############################################################################
 
 
-async def run(app, configuration, logger):
+async def run(app: SkybrushServer, configuration, logger: Logger):
     """Background task that is active while the extension is loaded."""
-    host = configuration.get("host", "")
-    port = configuration.get("port", suggest_port_number_for_service("tcp"))
-    pool_size = configuration.get("pool_size", 1000)
+    host: Optional[str] = str(configuration.get("host", ""))
+    port = int(configuration.get("port", suggest_port_number_for_service("tcp")))
+    pool_size = int(configuration.get("pool_size", 1000))
 
     if not host:
         host = None  # empty string is not okay on Linux

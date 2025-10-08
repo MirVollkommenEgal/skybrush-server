@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from abc import ABCMeta, abstractmethod
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
@@ -830,15 +830,16 @@ class MessageHub:
             message = self.create_response_or_notification(
                 message, in_response_to=in_response_to
             )
+
         if to is None:
             assert isinstance(
                 message, FlockwaveNotification
             ), "broadcast messages cannot be sent in response to a particular message"
             return await self.broadcast_message(message)
-
-        request = Request(message, to=to, in_response_to=in_response_to)
-        await self._queue_tx.send(request)
-        return request
+        else:
+            request = Request(message, to=to, in_response_to=in_response_to)
+            await self._queue_tx.send(request)
+            return request
 
     def unregister_message_handler(
         self, func: MessageHandler, message_types: Optional[Iterable[str]] = None
@@ -1152,7 +1153,7 @@ class MessageHub:
 ##############################################################################
 
 
-class RateLimiter(metaclass=ABCMeta):
+class RateLimiter(ABC):
     """Abstract base class for rate limiter objects."""
 
     name: Optional[str] = None
@@ -1187,7 +1188,7 @@ class BatchMessageRateLimiter(RateLimiter, Generic[T]):
 
     factory: Callable[[Iterable[T]], FlockwaveMessage]
     name: Optional[str] = None
-    delay: float = 0.1
+    delay: float = 0.2
 
     bundler: AsyncBundler = field(default_factory=AsyncBundler)
 
@@ -1228,7 +1229,7 @@ class UAVMessageRateLimiter(RateLimiter):
 
     factory: Callable[[Iterable[str]], FlockwaveMessage]
     name: Optional[str] = None
-    delay: float = 0.1
+    delay: float = 0.2
 
     bundler: AsyncBundler = field(default_factory=AsyncBundler)
 

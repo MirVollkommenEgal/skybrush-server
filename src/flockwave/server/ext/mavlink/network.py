@@ -21,6 +21,7 @@ from trio.abc import ReceiveChannel
 from trio_util import periodic
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Iterable,
     Iterator,
@@ -49,12 +50,13 @@ from .comm import (
 )
 from .driver import MAVLinkDriver, MAVLinkUAV
 from .enums import MAVAutopilot, MAVComponent, MAVMessageType, MAVState, MAVType
+from .errors import InvalidSystemIdError
 from .led_lights import MAVLinkLEDLightConfigurationManager
 from .packets import DroneShowStatus
 from .rssi import RSSIMode
 from .rtk import RTKCorrectionPacketEncoder
 from .signing import MAVLinkSigningConfiguration
-from .takeoff import ScheduledTakeoffManager
+from .takeoff import MAVLinkScheduledTakeoffManager
 from .types import (
     MAVLinkMessageMatcher,
     MAVLinkMessageSpecification,
@@ -64,12 +66,14 @@ from .types import (
 )
 from .utils import (
     flockwave_severity_from_mavlink_severity,
+    log_id_for_uav,
     python_log_level_from_mavlink_severity,
     log_id_from_message,
 )
 
 if TYPE_CHECKING:
     from flockwave.server.ext.show.config import DroneShowConfiguration
+    from flockwave.server.tasks.led_lights import LightConfiguration
 
 __all__ = ("MAVLinkNetwork",)
 
@@ -95,6 +99,7 @@ class MAVLinkNetwork:
 
     driver: MAVLinkDriver
     log: Logger
+    register_uav: Callable[[MAVLinkUAV], None]
     manager: CommunicationManager[MAVLinkMessageSpecification, Any]
 
     _connections: list[Connection]
@@ -137,6 +142,11 @@ class MAVLinkNetwork:
     sent to the ID formatter that derives the final ID in Skybrush.
     """
 
+    _uav_system_id_range: tuple[int, int] = (1, 256)
+    """The range of system IDs that a UAV in this network can have. Closed from
+    the left, open from the right.
+    """
+
     _uavs: dict[int, MAVLinkUAV]
     """Dictionary mapping MAVLink system IDs in the network to the corresponding
     UAVs.
@@ -165,6 +175,7 @@ class MAVLinkNetwork:
             routing=spec.routing,
             rssi_mode=spec.rssi_mode,
             signing=spec.signing,
+            uav_system_id_range=(1, spec.network_size + 1),
             uav_system_id_offset=spec.id_offset,
             use_broadcast_rate_limiting=spec.use_broadcast_rate_limiting,
         )
@@ -187,6 +198,7 @@ class MAVLinkNetwork:
         rssi_mode: RSSIMode = RSSIMode.RADIO_STATUS,
         signing: MAVLinkSigningConfiguration = MAVLinkSigningConfiguration.DISABLED,
         uav_system_id_offset: int = 0,
+        uav_system_id_range: tuple[int, int] = (1, 256),
         use_broadcast_rate_limiting: bool = False,
     ):
         """Constructor.
@@ -221,29 +233,36 @@ class MAVLinkNetwork:
                 signed and whether incoming unsigned messages are accepted.
             uav_system_id_offset: offset to add to the system ID of each UAV
                 before it is sent to the formatter function
+            uav_system_id_range: tuple specifying the (inclusive) range of
+                system IDs that a UAV in this network can have
         """
+        system_id = int(system_id)
+        if system_id < 1 or system_id > 255:
+            raise ValueError("system_id must be between 1 and 255")
+
         self.log = None  # type: ignore
         self._matchers = None  # type: ignore
 
         self._id = id
         self._id_formatter = id_formatter
-        self._led_light_configuration_manager = MAVLinkLEDLightConfigurationManager(
-            self
-        )
         self._packet_loss = max(float(packet_loss), 0.0)
         self._routing = routing or {}
         self._rssi_mode = rssi_mode
-        self._scheduled_takeoff_manager = ScheduledTakeoffManager(self)
         self._signing = signing
         self._statustext_targets = statustext_targets
-        self._system_id = max(min(int(system_id), 255), 1)
+        self._system_id = system_id
         self._uav_system_id_offset = int(uav_system_id_offset)
+        self._uav_system_id_range = uav_system_id_range
         self._use_broadcast_rate_limiting = bool(use_broadcast_rate_limiting)
 
         self._connections = []
         self._uavs = {}
         self._uav_addresses = {}
 
+        self._led_light_configuration_manager = MAVLinkLEDLightConfigurationManager(
+            self
+        )
+        self._scheduled_takeoff_manager = MAVLinkScheduledTakeoffManager(self)
         self._rtk_correction_packet_encoder = RTKCorrectionPacketEncoder()
 
     def add_connection(self, connection: Connection):
@@ -310,7 +329,7 @@ class MAVLinkNetwork:
         *,
         driver,
         log,
-        register_uav,
+        register_uav: Callable[[MAVLinkUAV], None],
         supervisor,
         use_connection,
     ):
@@ -501,7 +520,7 @@ class MAVLinkNetwork:
                 message, destination=Channel.RTK, allow_failure=True
             )
 
-    def notify_led_light_config_changed(self, config):
+    def notify_led_light_config_changed(self, config: LightConfiguration):
         """Notifies the network that the LED light configuration of the drones
         has changed in the system. The network will then update the LED light
         configuration of each drone.
@@ -526,6 +545,14 @@ class MAVLinkNetwork:
         """Returns the number of UAVs in this network."""
         return len(self._uavs)
 
+    @property
+    def uav_system_id_offset(self) -> int:
+        return self._uav_system_id_offset
+
+    @property
+    def uav_system_id_range(self) -> tuple[int, int]:
+        return self._uav_system_id_range
+
     async def send_heartbeat(self, target: MAVLinkUAV) -> Optional[MAVLinkMessage]:
         """Sends a heartbeat targeted to the given UAV.
 
@@ -544,19 +571,21 @@ class MAVLinkNetwork:
 
     async def send_packet(
         self,
-        spec: MAVLinkMessageSpecification,
+        spec: Optional[MAVLinkMessageSpecification],
         target: MAVLinkUAV,
+        *,
         wait_for_response: Optional[tuple[str, MAVLinkMessageMatcher]] = None,
         wait_for_one_of: Optional[dict[str, MAVLinkMessageSpecification]] = None,
         channel: Optional[str] = None,
-    ) -> Optional[MAVLinkMessage]:
+    ) -> Union[None, MAVLinkMessage, tuple[str, MAVLinkMessage]]:
         """Sends a message to the given UAV and optionally waits for a matching
         response.
 
         It is assumed (and not checked) that the UAV belongs to this network.
 
         Parameters:
-            spec: the specification of the MAVLink message to send
+            spec: the specification of the MAVLink message to send; ``None`` if
+                no packet needs to be sent and we only need to wait for a reply
             target: the UAV to send the message to
             wait_for_response: when not `None`, specifies a MAVLink message
                 type to wait for as a response, and an additional message
@@ -571,18 +600,62 @@ class MAVLinkNetwork:
                 the original message was sent.
             channel: specifies the channel that the packet should be sent on;
                 defaults to the primary channel of the network
+
+        Returns:
+            ``None`` if `wait_for_response` and `wait_for_one_of` are both
+            ``None``; the received response if `wait_for_response` was not
+            ``None``; the key of the matched message specification and the
+            message itself if `wait_for_one_of` was not ``None``.
         """
-        spec[1].update(
-            target_system=target.system_id,
-            target_component=MAVComponent.AUTOPILOT1,
-            _mavlink_version=target.mavlink_version,
-        )
+        tasks: dict[str, Callable[[], Awaitable[MAVLinkMessage]]]
 
         address = self._uav_addresses.get(target)
         if address is None:
             raise RuntimeError("UAV has no address in this network")
 
         destination = (channel or Channel.PRIMARY, address)
+
+        if not spec:
+            # No sending, only waiting for a reply
+            if wait_for_response:
+                response_type, response_fields = wait_for_response
+                with self.expect_packet(
+                    response_type, response_fields, system_id=target.system_id
+                ) as future:
+                    return await future.wait()
+
+            elif wait_for_one_of:
+                tasks = {}
+
+                with ExitStack() as stack:
+                    # Prepare futures for every single message type that we expect
+                    for key, (
+                        response_type,
+                        response_fields,
+                    ) in wait_for_one_of.items():
+                        future = stack.enter_context(
+                            self.expect_packet(
+                                response_type,
+                                response_fields,
+                                system_id=target.system_id,
+                            )
+                        )
+                        tasks[key] = future.wait
+
+                    return await race(tasks)
+
+            else:
+                # Nothing to do as we don't send and don't expect anything
+                return
+
+        # From this point onwards, spec is not None, i.e. we are definitely
+        # sending something
+
+        spec[1].update(
+            target_system=target.system_id,
+            target_component=MAVComponent.AUTOPILOT1,
+            _mavlink_version=target.mavlink_version,
+        )
 
         if wait_for_response:
             response_type, response_fields = wait_for_response
@@ -612,6 +685,7 @@ class MAVLinkNetwork:
                 # succeed
                 await self.manager.send_packet(spec, destination)
                 return await race(tasks)
+
         else:
             await self.manager.send_packet(spec, destination)
 
@@ -627,6 +701,13 @@ class MAVLinkNetwork:
         """Creates a new UAV with the given system ID in this network and
         registers it in the UAV registry.
         """
+        lo, hi = self._uav_system_id_range
+        if system_id < lo or system_id >= hi:
+            raise InvalidSystemIdError(
+                system_id,
+                f"System ID must be between {lo} and {hi - 1}, got {system_id}",
+            )
+
         uav_id = self._id_formatter(system_id + self._uav_system_id_offset, self.id)
 
         self._uavs[system_id] = uav = self.driver.create_uav(uav_id)
@@ -649,7 +730,8 @@ class MAVLinkNetwork:
 
         Returns:
             the UAV belonging to the system ID of the message or `None` if the
-            message was a broadcast message
+            message was a broadcast message or belonged to a system ID that is
+            outside the range configured for this network
         """
         system_id: int = message.get_srcSystem()
         if system_id == 0:
@@ -657,7 +739,10 @@ class MAVLinkNetwork:
         else:
             uav = self._uavs.get(system_id)
             if not uav:
-                uav = self._create_uav(system_id)
+                try:
+                    uav = self._create_uav(system_id)
+                except InvalidSystemIdError:
+                    return None
 
             # TODO(ntamas): protect from address hijacking!
             self._uav_addresses[uav] = address
@@ -695,7 +780,10 @@ class MAVLinkNetwork:
             "BAD_DATA": nop,
             "COMMAND_ACK": nop,
             "COMMAND_LONG": self._handle_message_command_long,
-            "DATA16": self._handle_message_data16,
+            "DATA16": self._handle_message_data,
+            "DATA32": self._handle_message_data,
+            "DATA64": self._handle_message_data,
+            "DATA96": self._handle_message_data,
             "FENCE_STATUS": nop,
             "FILE_TRANSFER_PROTOCOL": nop,
             "GLOBAL_POSITION_INT": self._handle_message_global_position_int,
@@ -822,7 +910,7 @@ class MAVLinkNetwork:
         if uav:
             uav.handle_message_command_long(message)
 
-    def _handle_message_data16(
+    def _handle_message_data(
         self, message: MAVLinkMessage, *, connection_id: str, address: Any
     ):
         if message.type == DroneShowStatus.TYPE:
@@ -915,7 +1003,7 @@ class MAVLinkNetwork:
 
         severity: int = message.severity
         if severity <= self._statustext_targets.server:
-            extra = self._log_extra_from_message(message)
+            extra = self._log_extra_from_message(message, uav)
             extra["telemetry"] = "ignore"
             self.log.log(
                 python_log_level_from_mavlink_severity(message.severity),
@@ -967,8 +1055,13 @@ class MAVLinkNetwork:
         """Logs an incoming MAVLink message for debugging purposes."""
         self.log.debug(str(message))
 
-    def _log_extra_from_message(self, message: MAVLinkMessage) -> dict[str, Any]:
-        return {"id": log_id_from_message(message, self.id)}
+    def _log_extra_from_message(
+        self, message: MAVLinkMessage, uav: MAVLinkUAV | None = None
+    ) -> dict[str, Any]:
+        if uav:
+            return {"id": log_id_for_uav(uav)}
+        else:
+            return {"id": log_id_from_message(message, self.id)}
 
     def _register_connection_aliases(
         self,

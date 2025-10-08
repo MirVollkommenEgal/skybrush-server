@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from abc import ABCMeta, abstractmethod
+from abc import ABC, abstractmethod
+from inspect import isawaitable
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Generic,
     Iterable,
     Optional,
+    TypedDict,
     Union,
     TypeVar,
     TYPE_CHECKING,
@@ -19,11 +22,13 @@ from flockwave.server.errors import NotSupportedError
 from flockwave.server.logger import log as base_log
 from flockwave.spec.schema import get_complex_object_schema
 
+from flockwave.server.model.commands import Progress, ProgressEvents
+
 from .attitude import Attitude
 from .battery import BatteryInfo
 from .devices import ObjectNode
 from .gps import GPSFix, GPSFixLike
-from .log import FlightLog, FlightLogMetadata
+from .log import FlightLogMetadata
 from .metamagic import ModelMeta
 from .mixins import TimestampLike, TimestampMixin
 from .object import ModelObject, register
@@ -50,6 +55,30 @@ VersionInfo = dict[str, str]
 """Type alias for version information objects returned from UAVDriver, mapping
 component names to version numbers
 """
+
+TUAV = TypeVar("TUAV", bound="UAV")
+"""Type variable that represents a UAV object."""
+
+TDriver = TypeVar("TDriver", bound="UAVDriver")
+"""Type variable that represents a UAV driver object."""
+
+TResult = TypeVar("TResult")
+"""Type variable that represents some unspecified result object."""
+
+
+class BulkParameterUploadResponse(TypedDict, total=False):
+    """Typed dictionary that is returned as a response for a PRM-SET-MANY
+    request.
+    """
+
+    success: bool
+    """Whether the bulk parameter upload succeeded. Always present."""
+
+    failed: list[str]
+    """List of parameter names for which the bulk upload failed. Omitted if
+    the caller cannot provide the exact list of parameter names where the
+    upload failed.
+    """
 
 
 class UAVStatusInfo(TimestampMixin, metaclass=ModelMeta):
@@ -122,7 +151,7 @@ class UAVStatusInfo(TimestampMixin, metaclass=ModelMeta):
 
 
 @register("uav")
-class UAV(ModelObject, metaclass=ABCMeta):
+class UAV(ModelObject, ABC):
     """Abstract object that defines the interface of objects representing
     UAVs.
     """
@@ -152,12 +181,12 @@ class UAV(ModelObject, metaclass=ABCMeta):
         raise NotImplementedError
 
 
-class UAVBase(UAV):
+class UAVBase(UAV, Generic[TDriver]):
     """Base object for UAV implementations. Provides a default implementation
     of the methods required by the UAV_ interface.
     """
 
-    def __init__(self, id: str, driver: "UAVDriver"):
+    def __init__(self, id: str, driver: TDriver):
         """Constructor.
 
         Parameters:
@@ -183,7 +212,7 @@ class UAVBase(UAV):
         return self._device_tree_node
 
     @property
-    def driver(self) -> "UAVDriver":
+    def driver(self) -> TDriver:
         """Returns the UAVDriver_ object that is responsible for handling
         communication with this UAV.
         """
@@ -412,14 +441,7 @@ class UAVBase(UAV):
         self._status.update_timestamp()
 
 
-TUAV = TypeVar("TUAV", bound="UAV")
-"""Type variable that represents a UAV object."""
-
-TResult = TypeVar("TResult")
-"""Type variable that represents some unspecified result object."""
-
-
-class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
+class UAVDriver(Generic[TUAV], ABC):
     """Interface specification for UAV drivers that are responsible for
     handling communication with a given group of UAVs via a common
     communication channel (e.g., a radio or a wireless network).
@@ -509,7 +531,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
             transport=transport,
         )
 
-    def get_log(self, uav: TUAV, log_id: str) -> FlightLog:
+    def get_log(self, uav: TUAV, log_id: str):
         """Asks the driver to retrieve the log with the given ID from the
         given UAV.
 
@@ -998,6 +1020,24 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
             value=value,
         )
 
+    def set_parameters(self, uavs: list[TUAV], parameters: dict[str, Any]):
+        """Asks the driver to set the value of multiple parameters on the given UAVs.
+
+        Typically, you don't need to override this method when implementing
+        a driver; override ``_set_parameters_single()`` instead.
+
+        Returns:
+            dict mapping UAVs to the corresponding results (which may also be
+            errors or awaitables; it is the responsibility of the caller to
+            evaluate errors and wait for awaitables)
+        """
+        return self._dispatch_request(
+            uavs,
+            "bulk parameter upload",
+            self._set_parameters_single,
+            parameters=parameters,
+        )
+
     def validate_command(self, command: str, args, kwds) -> Optional[str]:
         """Checks whether the driver could execute the command on the UAVs
         _in principle_, without knowing which UAVs the command will be sent to.
@@ -1148,7 +1188,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
 
     def _enter_low_power_mode_single(
         self, uav: TUAV, *, transport: Optional[TransportOptions] = None
-    ) -> None:
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to request a single UAV to switch to low-power mode.
 
         May return an awaitable if sending the request takes a longer time.
@@ -1171,7 +1211,9 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
         # to support low-power mode
         raise NotSupportedError
 
-    def _get_log_list_single(self, uav: TUAV) -> list[FlightLogMetadata]:
+    def _get_log_list_single(
+        self, uav: TUAV
+    ) -> Union[list[FlightLogMetadata], Awaitable[list[FlightLogMetadata]]]:
         """Asks the driver to retrieve the list of flight logs from a single
         UAV managed by this driver.
 
@@ -1211,7 +1253,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
 
     def _resume_from_low_power_mode_single(
         self, uav: TUAV, *, transport: Optional[TransportOptions] = None
-    ) -> None:
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to resume normal operation for a a single UAV that is
         now in low-power mode.
 
@@ -1235,7 +1277,9 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
         # to support low-power mode
         raise NotSupportedError
 
-    def _request_preflight_report_single(self, uav: TUAV) -> PreflightCheckInfo:
+    def _request_preflight_report_single(
+        self, uav: TUAV
+    ) -> Union[PreflightCheckInfo, Awaitable[PreflightCheckInfo]]:
         """Asks the driver to return a detailed report about the results of the
         preflight checks for a single UAV managed by this driver.
 
@@ -1254,7 +1298,9 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    def _request_version_info_single(self, uav: TUAV) -> VersionInfo:
+    def _request_version_info_single(
+        self, uav: TUAV
+    ) -> Union[VersionInfo, Awaitable[VersionInfo]]:
         """Asks the driver to return a mapping from component names to the
         corresponding version numbers for a single UAV managed by this driver.
 
@@ -1275,7 +1321,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
 
     def _send_fly_to_target_signal_single(
         self, uav: TUAV, target: GPSCoordinate
-    ) -> None:
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to send a "fly to target" signal to a single UAV
         managed by this driver.
 
@@ -1302,7 +1348,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
 
     def _send_hover_signal_single(
         self, uav: TUAV, *, transport: Optional[TransportOptions] = None
-    ) -> None:
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to send a position hold signal to a single UAV
         managed by this driver.
 
@@ -1327,7 +1373,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
 
     def _send_landing_signal_single(
         self, uav: TUAV, *, transport: Optional[TransportOptions] = None
-    ) -> None:
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to send a landing signal to a single UAV managed
         by this driver.
 
@@ -1356,7 +1402,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
         duration: int,
         *,
         transport: Optional[TransportOptions] = None,
-    ) -> None:
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to send a light or sound emission signal to a
         single UAV managed by this driver.
 
@@ -1394,7 +1440,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
         force: bool = False,
         *,
         transport: Optional[TransportOptions] = None,
-    ) -> None:
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to send a signal to start or stop the motors of the
         given UAVs, each of which are assumed to be managed by this driver.
 
@@ -1422,8 +1468,8 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
         raise NotImplementedError
 
     def _send_reset_signal_single(
-        self, uav: TUAV, *, component: str, transport: Optional[TransportOptions] = None
-    ) -> None:
+        self, uav: TUAV, component: str, *, transport: Optional[TransportOptions] = None
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to send a reset signal to a single UAV managed by
         this driver.
 
@@ -1450,7 +1496,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
 
     def _send_return_to_home_signal_single(
         self, uav: TUAV, *, transport: Optional[TransportOptions] = None
-    ) -> None:
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to send a return-to-home signal to a single UAV
         managed by this driver.
 
@@ -1475,7 +1521,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
 
     def _send_shutdown_signal_single(
         self, uav: TUAV, *, transport: Optional[TransportOptions] = None
-    ) -> None:
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to send a shutdown signal to a single UAV managed
         by this driver.
 
@@ -1504,7 +1550,7 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
         *,
         scheduled: bool = False,
         transport: Optional[TransportOptions] = None,
-    ) -> None:
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to send a takeoff signal to a single UAV managed
         by this driver.
 
@@ -1527,7 +1573,9 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    def _set_parameter_single(self, uav: TUAV, name: str, value: Any) -> None:
+    def _set_parameter_single(
+        self, uav: TUAV, name: str, value: Any
+    ) -> Union[None, Awaitable[None]]:
         """Asks the driver to set the value of a parameter with the given
         name for a single UAV managed by this driver.
 
@@ -1545,6 +1593,63 @@ class UAVDriver(Generic[TUAV], metaclass=ABCMeta):
                 driver and will not be supported in the future either
         """
         raise NotImplementedError
+
+    async def _set_parameters_single(
+        self, uav: TUAV, parameters: dict[str, Any]
+    ) -> ProgressEvents[BulkParameterUploadResponse]:
+        """Asks the driver to set the values of multiple parameters for a single
+        UAV managed by this driver.
+
+        May return an awaitable if preparing the result takes a longer time.
+
+        Since we are dealing with multiple parameters here that may be changed
+        independently, the function attempts to return even if some of the
+        parameters have not been uploaded successfully. The result conveys
+        more detailed information about whether the upload succeeded or not.
+
+        The default implementation falls back to multiple calls to
+        `_set_parameter_single()` in a sequential manner, sorted by keys in
+        alphabetical order. Override this function in concrete driver
+        implementations if you have a more efficient method for bulk parameter
+        uploads.
+
+        The default implementation always returns an awaitable as we have no
+        way of knowing whether `_set_parameter_single()` is sync or async
+        without calling it.
+
+        Raises:
+            NotImplementedError: if the operation is not supported by the
+                driver yet, but there are plans to implement it
+            NotSupportedError: if the operation is not supported by the
+                driver and will not be supported in the future either
+
+        Returns:
+            a dictionary with a `success` key that contains whether all the
+            parameters have been uploaded successfully, and an optional `failed`
+            key that contains the list of parameter names where the upload
+            failed.
+        """
+        failed: list[str] = []
+
+        num_params = len(parameters)
+        last_percentage = -1
+
+        for index, name in enumerate(sorted(parameters.keys())):
+            value = parameters[name]
+
+            try:
+                result = self._set_parameter_single(uav, name, value)
+                if isawaitable(result):
+                    await result
+            except Exception:
+                failed.append(name)
+
+            percentage = int((index + 1) / num_params * 100)
+            if percentage > last_percentage:
+                yield Progress(percentage=percentage)
+                last_percentage = percentage
+
+        yield {"success": not failed, "failed": failed}
 
 
 class PassiveUAV(UAVBase):
@@ -1591,9 +1696,9 @@ class PassiveUAVDriver(UAVDriver[PassiveUAV]):
         return self.app.object_registry.add_if_missing(id, factory=self._create_uav)
 
     def _dispatch_request(
-        self, uavs: Iterable[UAV], signal_name: str, handler, broadcaster=None, **kwds
+        self, uavs: Iterable[UAV], request_name: str, handler, broadcaster=None, **kwds
     ) -> dict[UAV, Any]:
-        error = RuntimeError("{0} not supported".format(signal_name))
+        error = RuntimeError("{0} not supported".format(request_name))
         return dict.fromkeys(uavs, error)
 
 

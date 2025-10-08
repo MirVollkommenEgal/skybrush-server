@@ -12,12 +12,12 @@ from logging import Logger
 from math import inf, isfinite
 from time import monotonic
 from trio import Event, fail_after, move_on_after, sleep, TooSlowError
-from typing import Any, AsyncIterator, Callable, Optional, Union
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Union
 
 from flockwave.gps.time import datetime_to_gps_time_of_week, gps_time_of_week_to_utc
 from flockwave.gps.vectors import GPSCoordinate, VelocityNED
 
-from flockwave.concurrency import delayed
+from flockwave.concurrency import delayed, FutureCancelled
 from flockwave.server.command_handlers import (
     create_calibration_command_handler,
     create_color_command_handler,
@@ -28,7 +28,11 @@ from flockwave.server.command_handlers import (
 from flockwave.server.errors import NotSupportedError
 from flockwave.server.ext.show.config import AuthorizationScope
 from flockwave.server.model.battery import BatteryInfo
-from flockwave.server.model.commands import Progress
+from flockwave.server.model.commands import (
+    Progress,
+    ProgressEvents,
+    ProgressEventsWithSuspension,
+)
 from flockwave.server.model.devices import DeviceTreeMutator
 from flockwave.server.model.geofence import GeofenceConfigurationRequest, GeofenceStatus
 from flockwave.server.model.gps import GPSFix, GPSFixType as OurGPSFixType
@@ -36,7 +40,12 @@ from flockwave.server.model.log import FlightLog, FlightLogMetadata
 from flockwave.server.model.preflight import PreflightCheckInfo, PreflightCheckResult
 from flockwave.server.model.safety import SafetyConfigurationRequest
 from flockwave.server.model.transport import TransportOptions
-from flockwave.server.model.uav import VersionInfo, UAVBase, UAVDriver
+from flockwave.server.model.uav import (
+    BulkParameterUploadResponse,
+    VersionInfo,
+    UAVBase,
+    UAVDriver,
+)
 from flockwave.server.show import (
     get_altitude_reference_from_show_specification,
     get_coordinate_system_from_show_specification,
@@ -119,29 +128,55 @@ def transport_options_to_channel(options: Optional[TransportOptions]) -> str:
 
 
 class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
-    """Driver class for MAVLink-based drones.
+    """Driver class for MAVLink-based drones."""
 
-    Attributes:
-        app: the app in which the driver lives
-        create_device_tree_mutator: a function that should be called by the
-            driver as a context manager whenever it wants to mutate the state
-            of the device tree
-        broadcast_packet: a function that should be called by the driver
-            whenever it wants to broadcast a packet. The function must be
-            called with the packet to send. May be `None` if broadcasting
-            is not supported.
-        send_packet: a function that should be called by the driver whenever it
-            wants to send a packet. The function must be called with the packet
-            to send, and a pair formed by the medium via which the packet
-            should be forwarded and the destination address in that medium.
+    assume_data_streams_configured: bool = False
+    """Whether to assume that UAVs managed by this driver already have their
+    MAVLink data streams configured appropriately. Used to skip the initialization
+    part, which is useful if you have thousands of drones and you know that
+    they are configured correctly.
+    """
+
+    autopilot_factory: Optional[Callable[[], Autopilot]] = None
+    """Factory function that returns a new Autopilot_ instance to be used by
+    drones managed by this driver. `None` means to infer the autopilot type
+    automatically from the heartbeat and the autopilot capabilities. Used to
+    skip the extra messages associated with the process, which is useful if you
+    have thousands of drones and you know which autopilot they are using.
     """
 
     broadcast_packet: PacketBroadcasterFn
+    """A function that should be called by the driver whenever it wants to
+    broadcast a packet. The function must be called with the packet to send.
+    """
+
     create_device_tree_mutator: Callable[[], DeviceTreeMutator]
+    """A function that should be called by the driver as a context manager
+    whenever it wants to mutate the state of the device tree.
+    """
+
     log: Logger
+    """Logger to use to write log messages."""
+
     mandatory_custom_mode: Optional[int]
-    run_in_background: Callable[[Callable], None]
+    """Custom mode to switch drones to when they are seen for the first time."""
+
+    run_in_background: Callable[[Callable[[], Awaitable[None]]], None]
+    """A function that should be called by the driver whenever it wants to
+    run an asynchronous function in the background.
+    """
+
     send_packet: PacketSenderFn
+    """A function that should be called by the driver whenever it wants to send
+    a packet. The function must be called with the packet to send, and a pair
+    formed by the medium via which the packet should be forwarded and the
+    destination address in that medium.
+    """
+
+    use_bulk_parameter_uploads: bool = False
+    """Whether to use bulk parameter uploads instead of individual uploads if
+    the autopilot supports bulk uploads.
+    """
 
     def __init__(self, app=None):
         """Constructor.
@@ -153,6 +188,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
 
         self.app = app  # type: ignore
 
+        self.autopilot_factory = None
         self.broadcast_packet = None  # type: ignore
         self.create_device_tree_mutator = None  # type: ignore
         self.log = None  # type: ignore
@@ -161,7 +197,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         self.send_packet = None  # type: ignore
 
         self._default_timeout = 2
-        self._default_retries = 5
+        self._default_retries = 10
         self._default_delay = 0.1
 
     async def broadcast_command_long_with_retries(
@@ -679,23 +715,30 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         if retries is None or retries < 0:
             retries = self._default_retries
 
-        if not wait_for_response and not wait_for_one_of:
-            raise RuntimeError(
-                "'wait_for_response' and 'wait_for_one_of' must be provided"
-            )
-
         response = None
 
         while retries >= 0:
             try:
                 with fail_after(timeout):
-                    response = await self.send_packet(
-                        spec,
-                        target,
-                        wait_for_response=wait_for_response,
-                        wait_for_one_of=wait_for_one_of,
-                        channel=channel,
-                    )
+                    if wait_for_response is not None:
+                        response = await self.send_packet(
+                            spec,
+                            target,
+                            wait_for_response=wait_for_response,
+                            channel=channel,
+                        )
+                    elif wait_for_one_of is not None:
+                        response = await self.send_packet(
+                            spec,
+                            target,
+                            wait_for_one_of=wait_for_one_of,
+                            channel=channel,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "At least one of 'wait_for_response' and 'wait_for_one_of' "
+                            "must be provided"
+                        )
                     break
             except TooSlowError:
                 retries -= 1
@@ -716,7 +759,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         )
 
     async def _enter_low_power_mode_single(
-        self, uav: "MAVLinkUAV", *, transport: Optional[TransportOptions]
+        self, uav: "MAVLinkUAV", *, transport: Optional[TransportOptions] = None
     ) -> None:
         # Effectively the same as shutdown, but without the attempt to stop the
         # motors (so drones where the motors are running will not be affected)
@@ -731,7 +774,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
 
     async def get_log(
         self, uav: "MAVLinkUAV", log_id: str
-    ) -> AsyncIterator[Union[Progress, Optional[FlightLog]]]:
+    ) -> ProgressEvents[Optional[FlightLog]]:
         try:
             log_number = int(log_id)
         except ValueError:
@@ -770,7 +813,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         # be resumed (i.e. _notify_rebooted_by_us())?
 
     async def _resume_from_low_power_mode_single(
-        self, uav: "MAVLinkUAV", *, transport: Optional[TransportOptions]
+        self, uav: "MAVLinkUAV", *, transport: Optional[TransportOptions] = None
     ) -> None:
         # This is not supported by standard MAVLink so it relies on a custom
         # protocol extension
@@ -890,7 +933,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             raise RuntimeError(f"Resetting {component!r} is not supported")
 
     async def _send_reset_signal_single(
-        self, uav: "MAVLinkUAV", component, *, transport=None
+        self, uav: "MAVLinkUAV", component: str, *, transport=None
     ) -> None:
         channel = transport_options_to_channel(transport)
 
@@ -973,8 +1016,35 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         try:
             value_as_float = float(value)
         except ValueError:
-            raise RuntimeError("parameter value must be numeric") from None
+            raise RuntimeError(f"Value of parameter {name!r} must be numeric") from None
         await uav.set_parameter(name, value_as_float)
+
+    async def _set_parameters_single(
+        self, uav: "MAVLinkUAV", parameters: dict[str, Any]
+    ) -> ProgressEvents[BulkParameterUploadResponse]:
+        if self.use_bulk_parameter_uploads:
+            parameters_as_float = {}
+            for name, value in parameters.items():
+                try:
+                    value_as_float = float(value)
+                except ValueError:
+                    raise RuntimeError(
+                        f"Value of parameter {name!r} must be numeric"
+                    ) from None
+                parameters_as_float[name] = value_as_float
+
+            try:
+                await uav.set_parameters(parameters_as_float)
+            except Exception:
+                if self.log:
+                    self.log.exception("Failed to set parameters")
+                yield {"success": False}
+            else:
+                yield {"success": True}
+
+        else:
+            async for event in super()._set_parameters_single(uav, parameters):
+                yield event
 
 
 @dataclass
@@ -999,10 +1069,9 @@ class MAVLinkMessageRecord:
         self.timestamp = monotonic()
 
 
-class MAVLinkUAV(UAVBase):
+class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     """Subclass for UAVs created by the driver for MAVLink-based drones."""
 
-    driver: MAVLinkDriver
     notify_updated: Callable[[], None]
     send_log_message_to_gcs: GCSLogMessageSender
 
@@ -1051,13 +1120,13 @@ class MAVLinkUAV(UAVBase):
     ensure that the log downloader object is created on-demand.
     """
 
-    _network_id = ""
+    _network_id: str = ""
     """Stores the MAVLink network ID of the drone (not part of the MAVLink
     messages; used by us to track which MAVLink network of ours the
     drone belongs to).
     """
 
-    _system_id = 0
+    _system_id: int = 0
     """MAVLink system ID of the drone. Zero if unspecified or unknown."""
 
     _autopilot: Autopilot
@@ -1078,6 +1147,11 @@ class MAVLinkUAV(UAVBase):
 
     _gps_fix: GPSFix
     """Current GPS fix status of the drone"""
+
+    _last_autopilot_capabilities_requested_at: Optional[float] = None
+    """Stores the time when we attempted to retrieve the autopilot capabilities
+    for the last time. Used to avoid frequent requests.
+    """
 
     _last_data_stream_configuration_attempted_at: Optional[float] = None
     """Stores the time when we attempted to configure the data streams for
@@ -1116,7 +1190,9 @@ class MAVLinkUAV(UAVBase):
     def __init__(self, *args, **kwds):
         super().__init__(*args, **kwds)
 
-        self._autopilot = UnknownAutopilot()
+        make_autopilot = self.driver.autopilot_factory or UnknownAutopilot
+        self._autopilot = make_autopilot()
+
         self._battery = BatteryInfo()
         self._connected_event = Event()
         self._gps_fix = GPSFix()
@@ -1147,7 +1223,7 @@ class MAVLinkUAV(UAVBase):
         self._network_id = network_id
         self._system_id = system_id
 
-    async def calibrate_accelerometer(self) -> AsyncIterator[Progress]:
+    async def calibrate_accelerometer(self) -> ProgressEventsWithSuspension[None, str]:
         """Calibrates the accelerometers of the UAV.
 
         Yields:
@@ -1164,7 +1240,7 @@ class MAVLinkUAV(UAVBase):
             # Turn NotImplementedError from the autopilot into a NotSupportedError
             raise NotSupportedError from None
 
-    async def calibrate_compass(self) -> AsyncIterator[Progress]:
+    async def calibrate_compass(self) -> ProgressEventsWithSuspension[None, str]:
         """Calibrates the compasses of the UAV.
 
         Yields:
@@ -1181,7 +1257,9 @@ class MAVLinkUAV(UAVBase):
             # Turn NotImplementedError from the autopilot into a NotSupportedError
             raise NotSupportedError from None
 
-    async def calibrate_component(self, component: str) -> AsyncIterator[Progress]:
+    async def calibrate_component(
+        self, component: str
+    ) -> ProgressEventsWithSuspension[None, str]:
         """Calibrates a component of the UAV.
 
         Parameters:
@@ -1462,12 +1540,12 @@ class MAVLinkUAV(UAVBase):
         """
         return self._scheduled_takeoff_time_gps_time_of_week
 
-    async def set_parameter(self, name: str, value: float) -> None:
-        """Sets the value of a parameter on the UAV."""
-        # Basic sanity check on the value
-        if not isfinite(value):
-            raise RuntimeError("parameter value must be finite")
+    async def _set_parameter_single(self, name: str, value: float) -> None:
+        """Sets the value of a single parameter on the UAV.
 
+        This function assumes that all sanity checks on the name and the value
+        have already been performed by the caller.
+        """
         # We need to retrieve the current value of the parameter first because
         # we need its type
         param_id = name.encode("utf-8")[:16]
@@ -1503,6 +1581,38 @@ class MAVLinkUAV(UAVBase):
                     f"Failed to set parameter {name!r}, "
                     f"tried to set {value!r}, got {observed_value!r}"
                 ) from None
+
+    async def set_parameter(self, name: str, value: float) -> None:
+        """Sets the value of a single parameter on the UAV."""
+        return await self.set_parameters({name: value})
+
+    async def set_parameters(self, parameters: dict[str, float]) -> None:
+        """Sets the value of multiple parameters on the UAV, preferably in a
+        more efficient manner if the autopilot of the drone supports MAVFTP
+        parameter uploads.
+        """
+        if not parameters:
+            return
+
+        # Basic sanity check on the values
+        for name, value in parameters.items():
+            if not isfinite(value):
+                raise RuntimeError(f"Value of parameter {name!r} must be finite")
+
+        if len(parameters) > 1 and self._autopilot.supports_mavftp_parameter_upload:
+            # Do a bulk upload
+            async with aclosing(MAVFTP.for_uav(self)) as ftp:
+                filename, contents = self._autopilot.prepare_mavftp_parameter_upload(
+                    parameters
+                )
+                # TODO(ntamas): handle error code when closing the file
+                await ftp.put(contents, filename, skip_crc_check=True)
+
+        else:
+            # No support for bulk uploads, or we only have a single parameter,
+            # so just do it one by one
+            for name, value in sorted(parameters.items()):
+                await self._set_parameter_single(name, value)
 
     async def test_component(
         self, component: str, *, channel: str = Channel.PRIMARY
@@ -1600,6 +1710,8 @@ class MAVLinkUAV(UAVBase):
 
         self._last_skybrush_status_info = data
 
+        # Process the basic part of the packet that is always present (both with
+        # the standard and the compact telemetry profile)
         self._update_gps_fix_type_and_satellite_count(data.gps_fix, data.num_satellites)
 
         gps_start_time = data.start_time if data.start_time >= 0 else None
@@ -1625,6 +1737,29 @@ class MAVLinkUAV(UAVBase):
                 rtcm_counter_to_rssi(data.rtcm_counters[0]),
                 rtcm_counter_to_rssi(data.rtcm_counters[1]),
             ]
+
+        # If the status packet has an extended section, process the extended part
+        if data.extension:
+            extended_part = data.extension
+
+            # Process the missing information that the standard telemetry
+            # provides with the GLOBAL_POSITION_INT packet
+            self._position.lat = extended_part.lat
+            self._position.lon = extended_part.lng
+            self._position.amsl = extended_part.alt
+            self._position.ahl = extended_part.relative_alt
+            self._velocity.x = extended_part.vx
+            self._velocity.y = extended_part.vy
+            self._velocity.z = extended_part.vz
+
+            # Process the missing information that the standard telemetry
+            # provides with the GPS_RAW_INT packet
+            self._gps_fix.horizontal_accuracy = extended_part.h_acc
+            self._gps_fix.vertical_accuracy = extended_part.v_acc
+
+            updates["position"] = self._position
+            updates["velocity"] = self._velocity
+            updates["heading"] = extended_part.heading
 
         self.update_status(**updates)
 
@@ -1665,14 +1800,23 @@ class MAVLinkUAV(UAVBase):
 
         # Do we already have basic information about the autopilot capabilities?
         # If we don't, ask for them.
-        if not self.get_last_message(MAVMessageType.AUTOPILOT_VERSION):
-            self.driver.run_in_background(self._request_autopilot_capabilities)
+        if not self.driver.autopilot_factory and not self.get_last_message(
+            MAVMessageType.AUTOPILOT_VERSION
+        ):
+            now = monotonic()
+            if (
+                self._last_autopilot_capabilities_requested_at is None
+                or now - self._last_autopilot_capabilities_requested_at > 2
+            ):
+                self._last_autopilot_capabilities_requested_at = now
+                self.driver.run_in_background(self._request_autopilot_capabilities)
 
         # If we haven't received a SYS_STATUS message for a while but we keep
         # on receiving heartbeats, chances are that the data streams are not
         # configured correctly so we configure them.
         if (
-            age_of_last_heartbeat < 2
+            not self.driver.assume_data_streams_configured
+            and age_of_last_heartbeat < 2
             and self.get_age_of_message(MAVMessageType.SYS_STATUS) > 5
         ):
             self._configure_data_streams_soon()
@@ -1852,7 +1996,7 @@ class MAVLinkUAV(UAVBase):
         connection.
         """
         self.driver.run_in_background(
-            delayed(1, self.notify_disconnection, ensure_async=True)
+            delayed(1, self.notify_disconnection, ensure_async=True)  # type: ignore[reportArgumentType]
         )
 
     def _reset_mavlink_version(self) -> None:
@@ -2340,6 +2484,9 @@ class MAVLinkUAV(UAVBase):
             except TooSlowError:
                 # attempt timed out, even after retries, so we just give up
                 pass
+            except FutureCancelled:
+                # This is okay, server is shutting down
+                return
             finally:
                 self._configuring_data_streams = False
 
@@ -2435,7 +2582,8 @@ class MAVLinkUAV(UAVBase):
         """Handles a reboot event on the autopilot and attempts to re-initialize
         the data streams.
         """
-        self._configure_data_streams_soon(force=True)
+        if not self.driver.assume_data_streams_configured:
+            self._configure_data_streams_soon(force=True)
 
         # No need to request the autopilot capabilities here; we do it after
         # every heartbeat if we don't have them yet. See the comment in
@@ -2466,6 +2614,9 @@ class MAVLinkUAV(UAVBase):
             success = await self.driver.send_command_long(
                 self, MAVCommand.REQUEST_AUTOPILOT_CAPABILITIES, param1=1
             )
+        except FutureCancelled:
+            # This is okay, server is shutting down
+            return
         except TooSlowError:
             self.driver.log.warning(
                 "Failed to request autopilot capabilities; no confirmation "
@@ -2559,8 +2710,8 @@ class MAVLinkUAV(UAVBase):
         detailed explanation in the source code there.
         """
         errors: dict[int, bool] = {
-            FlockwaveErrorCode.TIMESYNC_ERROR: status.has_timesync_error,
-            FlockwaveErrorCode.FAR_FROM_TAKEOFF_POSITION: status.is_misplaced_before_takeoff,
+            FlockwaveErrorCode.TIMESYNC_ERROR.value: status.has_timesync_error,
+            FlockwaveErrorCode.FAR_FROM_TAKEOFF_POSITION.value: status.is_misplaced_before_takeoff,
         }
         self.ensure_errors(errors)
 
@@ -2576,10 +2727,10 @@ class MAVLinkUAV(UAVBase):
         """
         self.clear_errors_up_to_and_including(FlockwaveErrorCode.UNSPECIFIED_WARNING)
         errors = {
-            FlockwaveErrorCode.AUTOPILOT_INIT_FAILED: False,
-            FlockwaveErrorCode.SLEEPING: True,
+            FlockwaveErrorCode.AUTOPILOT_INIT_FAILED.value: False,
+            FlockwaveErrorCode.SLEEPING.value: True,
         }
-        self.ensure_errors(errors)  # type: ignore
+        self.ensure_errors(errors)
 
     def _update_errors_from_sys_status_and_heartbeat(self) -> None:
         """Updates the error codes based on the most recent HEARTBEAT and
@@ -2675,37 +2826,39 @@ class MAVLinkUAV(UAVBase):
         # successful show.
 
         errors = {
-            FlockwaveErrorCode.SLEEPING: False,
-            FlockwaveErrorCode.LANDING: show_stage is DroneShowExecutionStage.LANDING,
-            FlockwaveErrorCode.TAKEOFF: show_stage is DroneShowExecutionStage.TAKEOFF,
-            FlockwaveErrorCode.AUTOPILOT_INIT_FAILED: (
+            FlockwaveErrorCode.SLEEPING.value: False,
+            FlockwaveErrorCode.LANDING.value: show_stage
+            is DroneShowExecutionStage.LANDING,
+            FlockwaveErrorCode.TAKEOFF.value: show_stage
+            is DroneShowExecutionStage.TAKEOFF,
+            FlockwaveErrorCode.AUTOPILOT_INIT_FAILED.value: (
                 heartbeat.system_status == MAVState.UNINIT.value
             ),
-            FlockwaveErrorCode.AUTOPILOT_INITIALIZING: (
+            FlockwaveErrorCode.AUTOPILOT_INITIALIZING.value: (
                 heartbeat.system_status == MAVState.BOOT.value
             ),
-            FlockwaveErrorCode.UNSPECIFIED_ERROR: (
+            FlockwaveErrorCode.UNSPECIFIED_ERROR.value: (
                 # RC errors apparently trigger this error condition with
                 # ArduCopter if we don't exclude it explicitly
                 heartbeat.system_status == MAVState.CRITICAL.value
                 and not not_healthy_sensors
                 and not has_rc_error
             ),
-            FlockwaveErrorCode.UNSPECIFIED_CRITICAL_ERROR: (
+            FlockwaveErrorCode.UNSPECIFIED_CRITICAL_ERROR.value: (
                 heartbeat.system_status == MAVState.EMERGENCY.value
                 and not not_healthy_sensors
             ),
-            FlockwaveErrorCode.MAGNETIC_ERROR: has_mag_error,
-            FlockwaveErrorCode.GYROSCOPE_ERROR: has_gyro_error,
-            FlockwaveErrorCode.ACCELEROMETER_ERROR: has_accel_error,
-            FlockwaveErrorCode.PRESSURE_SENSOR_ERROR: has_baro_error,
-            FlockwaveErrorCode.GPS_SIGNAL_LOST: has_gps_error,
-            FlockwaveErrorCode.PROXIMITY_ERROR: has_proximity_error,
-            FlockwaveErrorCode.MOTOR_MALFUNCTION: has_motor_error,
-            FlockwaveErrorCode.GEOFENCE_VIOLATION: (
+            FlockwaveErrorCode.MAGNETIC_ERROR.value: has_mag_error,
+            FlockwaveErrorCode.GYROSCOPE_ERROR.value: has_gyro_error,
+            FlockwaveErrorCode.ACCELEROMETER_ERROR.value: has_accel_error,
+            FlockwaveErrorCode.PRESSURE_SENSOR_ERROR.value: has_baro_error,
+            FlockwaveErrorCode.GPS_SIGNAL_LOST.value: has_gps_error,
+            FlockwaveErrorCode.PROXIMITY_ERROR.value: has_proximity_error,
+            FlockwaveErrorCode.MOTOR_MALFUNCTION.value: has_motor_error,
+            FlockwaveErrorCode.GEOFENCE_VIOLATION.value: (
                 has_geofence_error and are_motors_running
             ),
-            FlockwaveErrorCode.GEOFENCE_VIOLATION_WARNING: (
+            FlockwaveErrorCode.GEOFENCE_VIOLATION_WARNING.value: (
                 # Geofence error reported from SYS_STATUS...
                 (has_geofence_error and not are_motors_running)
                 # ...or no error reported from SYS_STATUS, but a geofence breach
@@ -2716,26 +2869,27 @@ class MAVLinkUAV(UAVBase):
                     and self._last_skybrush_status_info.is_geofence_breached
                 )
             ),
-            FlockwaveErrorCode.DRIFT_FROM_DESIRED_POSITION: (
+            FlockwaveErrorCode.DRIFT_FROM_DESIRED_POSITION.value: (
                 self._last_skybrush_status_info
                 and self._last_skybrush_status_info.is_far_from_expected_position
             ),
-            FlockwaveErrorCode.RC_SIGNAL_LOST_WARNING: has_rc_error,
-            FlockwaveErrorCode.BATTERY_CRITICAL: has_battery_error,
-            FlockwaveErrorCode.LOGGING_DEACTIVATED: has_logging_error,
-            FlockwaveErrorCode.DISARMED: are_motor_outputs_disabled,
-            FlockwaveErrorCode.PREARM_CHECK_IN_PROGRESS: is_prearm_check_in_progress,
+            FlockwaveErrorCode.RC_SIGNAL_LOST_WARNING.value: has_rc_error,
+            FlockwaveErrorCode.BATTERY_CRITICAL.value: has_battery_error,
+            FlockwaveErrorCode.LOGGING_DEACTIVATED.value: has_logging_error,
+            FlockwaveErrorCode.DISARMED.value: are_motor_outputs_disabled,
+            FlockwaveErrorCode.PREARM_CHECK_IN_PROGRESS.value: is_prearm_check_in_progress,
             # If the motors are not running yet but we are on the ground, ready
             # to fly, we use an informational flag to let the user know
-            FlockwaveErrorCode.ON_GROUND: not are_motors_running and is_in_standby,
+            FlockwaveErrorCode.ON_GROUND.value: not are_motors_running
+            and is_in_standby,
             # If the motors are running but we are not in the air yet; we use an
             # informational flag to let the user know
-            FlockwaveErrorCode.MOTORS_RUNNING_WHILE_ON_GROUND: are_motors_running
+            FlockwaveErrorCode.MOTORS_RUNNING_WHILE_ON_GROUND.value: are_motors_running
             and is_in_standby,
             # Use the special RTH error code if the drone is in RTH or smart RTH mode
             # and its mode index is larger than the standby mode (typically:
             # active, critical, emergency, poweroff, termination)
-            FlockwaveErrorCode.RETURN_TO_HOME: is_returning_home
+            FlockwaveErrorCode.RETURN_TO_HOME.value: is_returning_home
             and heartbeat.system_status > MAVState.STANDBY.value,
         }
 
@@ -2747,7 +2901,7 @@ class MAVLinkUAV(UAVBase):
             self._preflight_status.result = PreflightCheckResult.PASS
 
         # Update the error flags as needed
-        self.ensure_errors(errors)  # type: ignore
+        self.ensure_errors(errors)
 
     def _update_gps_fix_type_and_satellite_count(
         self, type: OurGPSFixType, num_satellites: Optional[int]

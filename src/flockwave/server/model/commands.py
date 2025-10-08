@@ -6,16 +6,33 @@ from contextlib import contextmanager
 from math import inf
 from time import time
 from trio import CancelScope, current_time
-from typing import Any, AsyncIterator, Iterator, Optional, Union, TypeVar
+from typing import (
+    Any,
+    AsyncGenerator,
+    Generic,
+    Iterator,
+    Optional,
+    Union,
+    TypeVar,
+    overload,
+)
 
 from flockwave.concurrency import Future
 from flockwave.spec.schema import get_complex_object_schema
 
 from .metamagic import ModelMeta
 
-__all__ = ("AsyncCommandEvents", "CommandExecutionStatus", "Progress")
+__all__ = (
+    "CommandExecutionStatus",
+    "Progress",
+    "ProgressEvents",
+    "ProgressEventsWithSuspension",
+    "Suspend",
+)
 
 
+R = TypeVar("R")
+S = TypeVar("S")
 T = TypeVar("T")
 
 
@@ -29,7 +46,7 @@ anything.
 C = TypeVar("C", bound="Progress")
 
 
-class Progress:
+class Progress(Generic[T]):
     """Progress object that may be yielded from command handlers implemented
     as an async iterator that yield one or more progress objects, optionally
     followed by a result object.
@@ -39,12 +56,37 @@ class Progress:
     percentage: Optional[int]
     object: Any
 
+    @overload
+    @classmethod
+    def done(cls, message: Optional[str] = None): ...
+
+    @overload
+    @classmethod
+    def done(cls, message: Optional[str] = None, *, object: T): ...
+
     @classmethod
     def done(cls, message: Optional[str] = None, *, object: Any = MISSING):
         """Convenience constructor for a progress message with 100%
         percentage.
         """
         return cls(percentage=100, message=message, object=object)
+
+    @overload
+    def __init__(
+        self,
+        *,
+        percentage: Optional[int] = None,
+        message: Optional[str] = None,
+    ): ...
+
+    @overload
+    def __init__(
+        self,
+        *,
+        percentage: Optional[int] = None,
+        message: Optional[str] = None,
+        object: T,
+    ): ...
 
     def __init__(
         self,
@@ -102,7 +144,7 @@ class Progress:
             )
 
 
-class Suspend(Progress):
+class Suspend(Generic[T]):
     """Suspension request object that may be yielded from command handlers
     implemented as an async iterator that yield one or more progress objects.
     Yielding this object will suspend the execution of the command and wait
@@ -111,6 +153,21 @@ class Suspend(Progress):
 
     message: Optional[str]
     object: Any
+
+    @overload
+    def __init__(
+        self,
+        *,
+        message: Optional[str] = None,
+    ): ...
+
+    @overload
+    def __init__(
+        self,
+        *,
+        message: Optional[str] = None,
+        object: T,
+    ): ...
 
     def __init__(
         self,
@@ -147,11 +204,18 @@ class Suspend(Progress):
             return f"{self.__class__.__name__}(message={self.message!r})"
 
 
-AsyncCommandEvents = AsyncIterator[Union[Progress, T]]
-"""Type alias for the return value of an async iterator that implements a
-command handler with progress reporting and client-to-server messaging
-support.
+ProgressEvents = AsyncGenerator[Union[Progress[R], R], None]
+"""Type alias for events that can be yielded from an async generator that
+generates progress and result events.
 """
+
+ProgressEventsWithSuspension = AsyncGenerator[Union[R, Progress[R], Suspend[S]], None]
+"""Type alias for events that can be yielded from an async generator that
+generates progress, suspension and result events.
+"""
+
+AsyncCommandEvents = ProgressEvents
+"""Deprecated alias to ProgressEvents."""
 
 
 class CommandExecutionStatus(metaclass=ModelMeta):

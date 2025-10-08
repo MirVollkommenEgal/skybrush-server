@@ -5,12 +5,137 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [main]
+## [master]
+
+### Added
+
+- The MAVLink extension now exports a function that can be used to get a handle
+  to a MAVLink network object from another extension. This will be used by the
+  Sidekick extension from this version onwards to provide a more accurate
+  mapping from system IDs to UAV IDs in case of more than 250 drones.
+
+- The sizes of MAVLink networks managed by the MAVLink extension can now be
+  limited. The default limit is 250 drones per network, from system ID 1 to
+  system ID 250 (inclusive). This is identical to the typical setup used in
+  drone shows. If you use drones with system IDs larger than 250, you must
+  adjust the network size accordingly in the configuration file.
+
+### Fixed
+
+- Fixed a bug in the MAVLink geofence upload protocol that sometimes reported a
+  successful geofence upload when the last packet in the upload sequence was
+  received out-of-order by the UAV.
+
+## [2.35.0] - 2025-09-04
+
+### Added
+
+- Added support for bulk parameter uploads with the `PRM-SET-MANY` command in
+  the protocol. UAV drivers that do not implement bulk parameter uploads will
+  fall back to single uploads in alphabetical order of the parameters.
+
+- The `mavlink` extension now supports bulk parameter uploads for ArduPilot
+  via MAVFTP. This needs to be turned on explicitly for the time being because
+  ArduPilot does not signal parameter upload failures correctly to the GCS when
+  using bulk uploads. The feature will be enabled permanently when the issue is
+  fixed in ArduPilot itself.
+
+## [2.34.0] - 2025-08-22
+
+### Added
+
+- Added `skynet`, an extension that provides support for high-performance
+  MAVLink parsing and routing to allow the server to scale up to 5000 drones
+  and beyond. This extension is currently in an experimental phase and no
+  configuration or documentation is provided yet; let us know if you own a large
+  fleet and you are interested in testing the extension at a large scale and
+  we will help you set things up.
+
+### Changed
+
+- Started implementation of a more compact telemetry format for MAVLink links.
+
+- Weather providers can now have an associated priority when they are registered.
+
+- The takeoff time configuration and authorization logic is now separated from
+  the `mavlink` extension so it became reusable in other extensions that provide
+  support for a certain type of drone.
+
+### Fixed
+
+- `uv sync` should now work consistently out-of-the-box after the repository is
+  checked out, even if the user has no access to private components of the
+  server.
+
+## [2.33.1] - 2025-08-15
+
+### Fixed
+
+- Improved resilience of geofence upload process to cases when packets are
+  arriving delayed or out-of-order on the drone.
+
+## [2.33.0] - 2025-08-11
+
+### Added
+
+- Added configuration options to the MAVLink extension to skip the initial
+  autopilot version discovery handshake and the configuration of MAVLink
+  stream rates if needed. These options can be used to achieve faster
+  initialization for large swarms consisting of thosands of drones.
+
+- Added a "Version info" page to the web UI that can be used to discover the
+  version number of all Python packages that the server depends on.
+
+### Changed
+
+- `UAV-INF` and `SYS-MSG` messages are now rate-limited at 5 Hz to reduce traffic
+  between Live and the server.
+
+- MAVFTP file uploads now use an adaptive timeout that tries to estimate the
+  round-trip time of the connection with an algorithm similar to how the TCP
+  protocol deals with it.
+
+- When logging messages from the MAVLink module, use the drone ID if it is
+  available instead of the MAVLink network and system ID.
+
+### Fixed
+
+- Fixed a bug in the pyro event encoder function of the show file encoder that
+  sometimes produced events out of order.
+
+- Autopilot version requests from the MAVLink module are now constrained to
+  at most one request in 2 seconds.
+
+## [2.32.3] - 2025-07-31
+
+### Changed
+
+- MAVFTP file upload timeouts are now adaptive similarly to how TCP connections
+  handle retransmissions.
+
+### Fixed
+
+- Better (more robust) handling of glitchy SMPTE timecodes. Timecodes with
+  invalid hour components (larger than 23) are now ignored.
+
+## [2.32.2] - 2025-07-21
+
+### Fixed
+
+- Revived the `flockwave.server.gateway` module that is currently used for the
+  Skybrush Live online demo on <https://account.skybrush.io>
+
+## [2.32.1] - 2025-07-17
 
 ### Changed
 
 - JSON parsing and decoding is now performed with `orjson` instead of the
   built-in `json` module.
+
+### Fixed
+
+- Fixed an irrelevant exception that appeared when the server was shut down
+  while a MAVFTP file upload was in progress.
 
 ## [2.32.0] - 2025-07-01
 

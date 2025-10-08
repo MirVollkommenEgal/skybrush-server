@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from errno import ENOSPC
 from functools import partial
 from io import BytesIO
 from itertools import cycle, islice
@@ -14,7 +15,6 @@ from struct import Struct
 from trio import (
     as_safe_channel,
     BrokenResourceError,
-    fail_after,
     move_on_after,
     TooSlowError,
     wrap_file,
@@ -24,17 +24,22 @@ from typing import (
     AsyncGenerator,
     AsyncIterator,
     Awaitable,
-    Callable,
     Iterable,
     Iterator,
     Optional,
+    Protocol,
     Union,
 )
 
+from flockwave.concurrency import (
+    AdaptiveExponentialBackoffPolicy,
+    RetryPolicy,
+    run_with_retries,
+)
 from flockwave.server.model.commands import Progress
 from flockwave.server.show.utils import crc32_mavftp as crc32
 
-from .types import MAVLinkMessage, spec
+from .types import MAVLinkMessage, spec, UAVBoundPacketSenderFn
 
 if TYPE_CHECKING:
     from .driver import MAVLinkUAV
@@ -42,11 +47,11 @@ if TYPE_CHECKING:
 __all__ = ("MAVFTP",)
 
 
-#: Type specification for FTP paths that are accepted by MAVFTP
 FTPPath = Union[str, bytes]
+"""Type specification for FTP paths that are accepted by MAVFTP."""
 
-#: Maximum number of bytes allowed in a single read/write operation
 _MAVFTP_CHUNK_SIZE = 239
+"""Maximum number of bytes allowed in a single read/write operation."""
 
 
 class MAVFTPOpCode(IntEnum):
@@ -105,13 +110,18 @@ class MAVFTPErrorCode(IntEnum):
     @staticmethod
     def to_string(code: int, errno: Optional[int] = None) -> str:
         result = _mavftp_error_codes.get(int(code)) or f"Unknown error code {int(code)}"
+        if errno == ENOSPC and code in (
+            MAVFTPErrorCode.FAIL,
+            MAVFTPErrorCode.FAIL_ERRNO,
+        ):
+            result = "No space left on device"
         if errno is not None:
             result = f"{result} (errno = {errno})"
         return result
 
 
-#: Struct representing the format of the payload of a MAVFTP message
 _MAVFTPMessageStruct = Struct("<HBBBBBxI")
+"""Struct representing the format of the payload of a MAVFTP message."""
 
 
 class ListingEntryType(Enum):
@@ -311,6 +321,10 @@ class MAVFTPMessage:
             raise ValueError("Message is not an error")
 
 
+class MAVFTPMessageSender(Protocol):
+    def __call__(self, message: MAVFTPMessage) -> Awaitable[MAVFTPMessage]: ...
+
+
 class MAVFTPSession:
     """Class representing a single reading or writing session over a MAVFTP
     connection.
@@ -319,11 +333,7 @@ class MAVFTPSession:
     doing; typically, the MAVFTP class uses this internally.
     """
 
-    def __init__(
-        self,
-        session_id: int,
-        sender: Callable[[MAVFTPMessage], Awaitable[MAVFTPMessage]],
-    ):
+    def __init__(self, session_id: int, sender: MAVFTPMessageSender):
         """Constructor.
 
         Parameters:
@@ -429,7 +439,12 @@ class MAVFTP:
     _closing: bool
     """Stores whether the MAVFTP connection is being closed."""
 
-    _sender: Callable[[MAVFTPMessage], Awaitable[None]]
+    _retry_policy: RetryPolicy
+    """The retry policy to use for sending MAVFTP messages within the context of
+    this connection.
+    """
+
+    _sender: UAVBoundPacketSenderFn
     """A function that can be called to send a MAVFTP message associated to
     this MAVFTP object.
     """
@@ -443,10 +458,16 @@ class MAVFTP:
         sender = partial(uav.driver.send_packet, target=uav)
         return cls(sender)
 
-    def __init__(self, sender: Callable[[MAVFTPMessage], Awaitable[None]]):
+    def __init__(self, sender: UAVBoundPacketSenderFn):
         """Constructor."""
         self._closed = False
         self._closing = False
+
+        self._retry_policy = AdaptiveExponentialBackoffPolicy(
+            max_retries=600,
+            base_timeout=0.1,
+            max_timeout=3,
+        )
 
         self._path = PurePosixPath("/")
         self._seq = islice(cycle(range(65536)), randint(0, 65535), None)
@@ -577,7 +598,12 @@ class MAVFTP:
                 raise
 
     async def put(
-        self, data: bytes, remote_path: FTPPath, parents: bool = False
+        self,
+        data: bytes,
+        remote_path: FTPPath,
+        *,
+        parents: bool = False,
+        skip_crc_check: bool = False,
     ) -> None:
         """Uploads a file at a local path to the given remote path.
 
@@ -586,8 +612,14 @@ class MAVFTP:
                 raw bytes object
             remote_path: remote folder where the file should be uploaded
             parents: whether to create any parent directories automatically
+            skip_crc_check: whether to skip the CRC check at the end of the upload.
+                This is useful when uploading "virtual files" like ArduPilot's
+                `@PARAM/param.pck` where the content of the file after the
+                upload is not expected to match the uploaded content.
         """
-        async with self.put_gen(data, remote_path, parents=parents) as progress:
+        async with self.put_gen(
+            data, remote_path, parents=parents, skip_crc_check=skip_crc_check
+        ) as progress:
             # This is a generator, so we need to consume it to actually
             # upload the file
             async for _ in progress:
@@ -595,8 +627,13 @@ class MAVFTP:
 
     @as_safe_channel
     async def put_gen(
-        self, data: bytes, remote_path: FTPPath, *, parents: bool = False
-    ) -> AsyncGenerator[Progress, None]:
+        self,
+        data: bytes,
+        remote_path: FTPPath,
+        *,
+        parents: bool = False,
+        skip_crc_check: bool = False,
+    ) -> AsyncGenerator[Progress[None], None]:
         """Uploads a file at a local path to the given remote path.
 
         Due to how Python's async generator cleanup works, this method has to
@@ -608,6 +645,10 @@ class MAVFTP:
                 raw bytes object
             remote_path: remote folder where the file should be uploaded
             parents: whether to create any parent directories automatically
+            skip_crc_check: whether to skip the CRC check at the end of the upload.
+                This is useful when uploading "virtual files" like ArduPilot's
+                `@PARAM/param.pck` where the content of the file after the
+                upload is not expected to match the uploaded content.
 
         Yields:
             progress updates about the state of the upload process
@@ -645,13 +686,14 @@ class MAVFTP:
                 else:
                     break
 
-        observed_crc = await self.crc32(remote_path)
-        if observed_crc != expected_crc:
-            raise RuntimeError(
-                "CRC mismatch, expected {0:08X}, got {1:08X}".format(
-                    expected_crc, observed_crc
+        if not skip_crc_check:
+            observed_crc = await self.crc32(remote_path)
+            if observed_crc != expected_crc:
+                raise RuntimeError(
+                    "CRC mismatch, expected {0:08X}, got {1:08X}".format(
+                        expected_crc, observed_crc
+                    )
                 )
-            )
 
         yield Progress(percentage=100)
 
@@ -671,7 +713,12 @@ class MAVFTP:
             yield session
 
     def _parents_of(self, path: FTPPath) -> Iterable[FTPPath]:
-        path_as_str = path if isinstance(path, str) else path.decode("utf-8")
+        if isinstance(path, str):
+            path_as_str = path
+        elif isinstance(path, memoryview):
+            path_as_str = path.tobytes().decode("utf-8")
+        else:
+            path_as_str = path.decode("utf-8")
         for parent_path in reversed(PurePosixPath(path_as_str).parents):
             yield self._to_ftp_path(parent_path)
 
@@ -693,8 +740,6 @@ class MAVFTP:
         self,
         message: MAVFTPMessage,
         *,
-        timeout: float = 0.1,
-        retries: int = 600,
         allow_nak: bool = False,
     ) -> MAVFTPMessage:
         """Sends a raw FTP message over the connection and waits for the response
@@ -702,9 +747,6 @@ class MAVFTP:
 
         Parameters:
             message: the MAVFTP message to send
-            timeout: maximum number of seconds to wait before attempting to
-                re-send the message
-            retries: maximum number of retries before giving up
             allow_nak: whether we consider a NAK message a valid response
 
         Returns:
@@ -718,23 +760,23 @@ class MAVFTP:
         expected_seq_no = next(self._seq)
         sender = self._sender
 
+        async def do_send():
+            reply = await sender(
+                spec.file_transfer_protocol(target_network=0, payload=encoded_message),
+                wait_for_response=spec.file_transfer_protocol(
+                    partial(MAVFTPMessage.matches_sequence_no, expected_seq_no)
+                ),
+            )
+            assert reply is not None
+            return reply
+
         while True:
             try:
-                with fail_after(timeout):
-                    reply = await sender(
-                        spec.file_transfer_protocol(
-                            target_network=0, payload=encoded_message
-                        ),
-                        wait_for_response=spec.file_transfer_protocol(
-                            partial(MAVFTPMessage.matches_sequence_no, expected_seq_no)
-                        ),
-                    )
-            except TooSlowError:
-                if retries > 0:
-                    retries -= 1
-                    continue
-                else:
-                    break
+                reply = await run_with_retries(do_send, policy=self._retry_policy)
+            except TimeoutError:
+                raise TooSlowError(
+                    "No response received for MAVFTP packet in time"
+                ) from None
 
             reply = MAVFTPMessage.decode(reply.payload)
             if reply.is_ack:
@@ -746,8 +788,6 @@ class MAVFTP:
                     reply.raise_error(replies_to=message)
             else:
                 raise RuntimeError("Received reply that is neither ACK nor NAK")
-
-        raise TooSlowError("No response received for MAVFTP packet in time")
 
     def _to_ftp_path(self, posix_path: PurePosixPath) -> bytes:
         return (str(posix_path)[1:] or ".").encode("utf-8")

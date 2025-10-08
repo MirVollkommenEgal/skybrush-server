@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import timezone
 from enum import IntEnum, IntFlag
@@ -248,7 +250,13 @@ class DroneShowExecutionStage(IntEnum):
 
 @dataclass
 class DroneShowStatus:
-    """Data class representing a Skybrush-specific drone show status object."""
+    """Dataclass representing a Skybrush-specific drone show status object.
+
+    This dataclass encapsulates information that can be extracted from the
+    standard drone show status packet. Information that can be extracted only
+    from the extended status packet is provided in a separate object attached
+    to the `extension` property.
+    """
 
     start_time: int = -1
     """Scheduled start time of the drone show, in GPS seconds of week, negative
@@ -258,7 +266,7 @@ class DroneShowStatus:
     elapsed_time: int = 0
     """Number of seconds elapsed in the drone show."""
 
-    flags: DroneShowStatusFlag = DroneShowStatusFlag.OFF
+    flags: int = DroneShowStatusFlag.OFF.value
     """Various status flags."""
 
     stage: DroneShowExecutionStage = DroneShowExecutionStage.OFF
@@ -281,23 +289,32 @@ class DroneShowStatus:
     in the last few seconds.
     """
 
+    extension: Optional[DroneShowStatusExtension] = None
+    """Extended status information, if provided at construction time."""
+
     TYPE: ClassVar[int] = 0x5B
-    """Identifier of Skybrush-specific DATA16 show status packets."""
+    """Identifier of Skybrush-specific DATA* show status packets."""
 
     _struct: ClassVar[Struct] = Struct("<iHBBBBhBB")
-    """Structure of Skybrush-specific DATA16 show status packets."""
+    """Structure of Skybrush-specific DATA* show status packets."""
 
     @classmethod
     def from_bytes(cls, data: bytes):
         """Constructs a DroneShowStatus_ object from the raw body of a MAVLink
-        DATA16 packet that has already been truncated to the desired length of
+        DATA* packet that has already been truncated to the desired length of
         the packet.
         """
+        # Remember the original length so we can decide how much padding was
+        # added later
         data_len = len(data)
+        is_extended = data_len > 14
 
+        # Length of standard packet is 14 bytes. Pad it to the required length
+        # if the data is shorter than 14 bytes.
         if data_len < 14:
             data = data.ljust(14, b"\x00")
 
+        # Unpack the standard section of the packet
         (
             start_time,
             light,
@@ -321,7 +338,7 @@ class DroneShowStatus:
             # No "flags3" field in the original packet. "flags3" contains the
             # authorization scope and we need to keep it consistent with the
             # authorization flag in the "flags" field.
-            if flags & DroneShowStatusFlag.HAS_AUTHORIZATION_TO_START:
+            if flags & DroneShowStatusFlag.HAS_AUTHORIZATION_TO_START.value:
                 flags3 |= (0x01) << 2
 
         # validate the authorization scope
@@ -343,6 +360,11 @@ class DroneShowStatus:
             else None,
         )
 
+        # if the packet is an extended status packet, parse the extended bits
+        extension = (
+            DroneShowStatusExtension.from_bytes(data[14:]) if is_extended else None
+        )
+
         return cls(
             start_time=start_time,
             elapsed_time=elapsed_time,
@@ -353,14 +375,15 @@ class DroneShowStatus:
             num_satellites=gps_health >> 3,
             authorization_scope=scope,
             rtcm_counters=rtcm_counters,
+            extension=extension,
         )
 
     @classmethod
     def from_mavlink_message(cls, message: MAVLinkMessage):
-        """Constructs a DroneShowStatus_ object from a MAVLink DATA16 packet.
+        """Constructs a DroneShowStatus_ object from a MAVLink DATA* packet.
 
         Raises:
-            ValueError: if the type of the MAVLink DATA16 packet does not match
+            ValueError: if the type of the MAVLink DATA* packet does not match
                 the expected type of a Skybrush-specific show status packet
         """
         if message.type != cls.TYPE:
@@ -382,34 +405,36 @@ class DroneShowStatus:
         """Returns whether the takeoff authorization flag is set in the drone
         show status message.
         """
-        return bool(self.flags & DroneShowStatusFlag.HAS_AUTHORIZATION_TO_START)
+        return bool(self.flags & DroneShowStatusFlag.HAS_AUTHORIZATION_TO_START.value)
 
     @property
     def has_timesync_error(self) -> bool:
         """Returns whether there is probably a time synchronization problem
         as we are receiving invalid timestamps from the GPS.
         """
-        return bool(self.flags & DroneShowStatusFlag.IS_GPS_TIME_BAD)
+        return bool(self.flags & DroneShowStatusFlag.IS_GPS_TIME_BAD.value)
 
     @property
     def is_far_from_expected_position(self) -> bool:
         """Returns whether the drone seems to be far from its expected position,
         typically during a show.
         """
-        return bool(self.flags & DroneShowStatusFlag.IS_FAR_FROM_EXPECTED_POSITION)
+        return bool(
+            self.flags & DroneShowStatusFlag.IS_FAR_FROM_EXPECTED_POSITION.value
+        )
 
     @property
     def is_geofence_breached(self) -> bool:
         """Returns whether at least one of the geofences is breached, even if
         the drone is configured not to act on them (i.e. report only)."""
-        return bool(self.flags & DroneShowStatusFlag.GEOFENCE_BREACHED)
+        return bool(self.flags & DroneShowStatusFlag.GEOFENCE_BREACHED.value)
 
     @property
     def is_misplaced_before_takeoff(self) -> bool:
         """Returns whether we are currently before the takeoff stage and the
         drone seems to be misplaced.
         """
-        return bool(self.flags & DroneShowStatusFlag.IS_MISPLACED_BEFORE_TAKEOFF)
+        return bool(self.flags & DroneShowStatusFlag.IS_MISPLACED_BEFORE_TAKEOFF.value)
 
     @property
     def message(self) -> str:
@@ -427,10 +452,13 @@ class DroneShowStatus:
         """Formats a status message from the execution stage and flags found in
         the drone show status packet.
         """
+        # This function is called frequently, and Python enums are a bit slow
+        # so we optimize enum access by using the 'value' property on them
+
         flags = self.flags
         stage = self.stage
 
-        if not flags & DroneShowStatusFlag.HAS_SHOW_FILE:
+        if not flags & DroneShowStatusFlag.HAS_SHOW_FILE.value:
             return "No show data"
 
         # If we are in a stage that implies that we are flying or we have an
@@ -441,24 +469,24 @@ class DroneShowStatus:
 
         # Looks like we are on the ground, so show the info that we can gather
         # from the flags
-        if not flags & DroneShowStatusFlag.HAS_ORIGIN:
+        if not flags & DroneShowStatusFlag.HAS_ORIGIN.value:
             return "Origin not set"
-        elif not flags & DroneShowStatusFlag.HAS_ORIENTATION:
+        elif not flags & DroneShowStatusFlag.HAS_ORIENTATION.value:
             return "Orientation not set"
-        elif flags & DroneShowStatusFlag.IS_MISPLACED_BEFORE_TAKEOFF:
+        elif flags & DroneShowStatusFlag.IS_MISPLACED_BEFORE_TAKEOFF.value:
             return "Not at takeoff position"
         elif (
-            not flags & DroneShowStatusFlag.HAS_START_TIME
+            not flags & DroneShowStatusFlag.HAS_START_TIME.value
             and stage != DroneShowExecutionStage.LANDED
         ):
-            if flags & DroneShowStatusFlag.HAS_AUTHORIZATION_TO_START:
+            if flags & DroneShowStatusFlag.HAS_AUTHORIZATION_TO_START.value:
                 return "Authorized without start time"
-            elif self.gps_fix < OurGPSFixType.FIX_3D:
+            elif self.gps_fix < OurGPSFixType.FIX_3D.value:
                 # This is needed here to explain why the start time might not
                 # have been set yet; interpreting the SHOW_START_TIME parameter
                 # needs GPS fix
                 return "No 3D GPS fix yet"
-            elif flags & DroneShowStatusFlag.IS_GPS_TIME_BAD:
+            elif flags & DroneShowStatusFlag.IS_GPS_TIME_BAD.value:
                 # If we get here, it means that we _do_ have 3D fix _but_ we
                 # still don't have a GPS timestamp. This can happen only if the
                 # GPS is not sending us the full timestamp; e.g., if it sends
@@ -471,7 +499,7 @@ class DroneShowStatus:
             else:
                 return "Start time not set"
         elif (
-            not flags & DroneShowStatusFlag.HAS_AUTHORIZATION_TO_START
+            not flags & DroneShowStatusFlag.HAS_AUTHORIZATION_TO_START.value
             and stage != DroneShowExecutionStage.LANDED
         ):
             if stage is DroneShowExecutionStage.OFF:
@@ -479,7 +507,7 @@ class DroneShowStatus:
                 return ""
             else:
                 return "Not authorized to start"
-        elif not flags & DroneShowStatusFlag.HAS_GEOFENCE:
+        elif not flags & DroneShowStatusFlag.HAS_GEOFENCE.value:
             return "Geofence not set"
         elif self.gps_fix < OurGPSFixType.FIX_3D:
             return "No 3D GPS fix yet"
@@ -487,3 +515,101 @@ class DroneShowStatus:
         # We are on the ground but there's nothing important to report from the
         # flags so just show the description of the stage
         return stage.description
+
+
+@dataclass
+class DroneShowStatusExtension:
+    """Dataclass representing the extended part of a Skybrush-specific drone
+    show status object.
+
+    This dataclass encapsulates information that can be extracted from the
+    extended drone show status packet only.
+    """
+
+    lat: float
+    """Latitude of the drone in degrees."""
+
+    lng: float
+    """Longitude of the drone in degrees."""
+
+    alt: float
+    """Altitude of the drone in meters above sea level."""
+
+    relative_alt: float
+    """Altitude of the drone relative to its home altitude, in meters."""
+
+    vx: float
+    """X (North) coordinate of the velocity of the drone, in m/s."""
+
+    vy: float
+    """Y (East) coordinate of the velocity of the drone, in m/s."""
+
+    vz: float
+    """Z (Down) coordinate of the velocity of the drone, in m/s."""
+
+    heading: float
+    """Heading of the drone."""
+
+    h_acc: Optional[float] = None
+    """Horizontal accuracy as reported by the GPS; ``None`` if not provided."""
+
+    v_acc: Optional[float] = None
+    """Vertical accuracy as reported by the GPS; ``None`` if not provided."""
+
+    show_id: Optional[int] = None
+    """Unique identifier of the show uploaded to the drone, if known."""
+
+    trajectory_index: Optional[int] = None
+    """Index of the trajectory that the drone is going to fly, if known."""
+
+    _struct: ClassVar[Struct] = Struct("<iiiihhhHHHIH")
+    """Structure of the packet."""
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        """Constructs a DroneShowStatusExtension_ object from the appropriate
+        section of the raw body of a MAVLink DATA* packet.
+
+        Typically you should not need to call this method directly; call
+        `DroneShowStatus.from_bytes(...)` on the full packet payload instead.
+        """
+        (
+            lat,
+            lng,
+            alt,
+            relative_alt,
+            vx,
+            vy,
+            vz,
+            heading,
+            h_acc,
+            v_acc,
+            show_id,
+            trajectory_index,
+        ) = cls._struct.unpack(data[: cls._struct.size])
+
+        if abs(lat) <= 900000000:
+            # latitude, longitude: convert to degrees
+            lat /= 1e7
+            lng /= 1e7
+            # altitudes: [mm] --> [m]
+            alt /= 1e3
+            relative_alt /= 1e3
+        else:
+            # treat invalid latitudes as an indication of "no GPS fix"
+            lat = lng = alt = relative_alt = 0.0
+
+        # velocity: [cm/s] --> [m/s]
+        vx /= 100.0
+        vy /= 100.0
+        vz /= 100.0
+
+        # heading: [cdeg] --> [deg]
+        heading = heading / 100.0 if abs(heading) <= 36000 else 0.0
+
+        # GPS accuracy
+        h_acc = h_acc / 1000.0 if h_acc > 0 else None
+        v_acc = v_acc / 1000.0 if v_acc > 0 else None
+
+        # TODO(ntamas): show ID, trajectory index
+        return cls(lat, lng, alt, relative_alt, vx, vy, vz, heading, h_acc, v_acc)

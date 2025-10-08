@@ -11,13 +11,20 @@ from typing import (
     ClassVar,
     Iterable,
     Optional,
+    Protocol,
     Sequence,
     Union,
+    TYPE_CHECKING,
+    overload,
 )
 
 from .enums import MAVSeverity
 from .rssi import RSSIMode
 from .signing import MAVLinkSigningConfiguration
+
+if TYPE_CHECKING:
+    from .driver import MAVLinkUAV
+
 
 __all__ = (
     "MAVLinkFlightModeNumbers",
@@ -58,12 +65,76 @@ pairs. These are used to construct new MAVLink messages.
 PacketBroadcasterFn = Callable[..., Awaitable[None]]
 """Type specification for the broadcast_packet() function of a MAVLinkNetwork object."""
 
-PacketSenderFn = Callable[..., Awaitable[Optional[MAVLinkMessage]]]
-"""Type specification for the send_packet() function of a MAVLinkNetwork object."""
+
+class PacketSenderFn(Protocol):
+    """Type specification for the send_packet() function of a MAVLinkNetwork_
+    bject.
+
+    See the documentation in `MAVLinkNetwork.send_packet()` for more details.
+    """
+
+    @overload
+    def __call__(
+        self,
+        spec: MAVLinkMessageSpecification,
+        target: MAVLinkUAV,
+        *,
+        channel: Optional[str] = None,
+    ) -> Awaitable[None]: ...
+
+    @overload
+    def __call__(
+        self,
+        spec: MAVLinkMessageSpecification,
+        target: MAVLinkUAV,
+        *,
+        wait_for_response: tuple[str, MAVLinkMessageMatcher],
+        channel: Optional[str] = None,
+    ) -> Awaitable[MAVLinkMessage]: ...
+
+    @overload
+    def __call__(
+        self,
+        spec: MAVLinkMessageSpecification,
+        target: MAVLinkUAV,
+        *,
+        wait_for_one_of: dict[str, MAVLinkMessageSpecification],
+        channel: Optional[str] = None,
+    ) -> Awaitable[tuple[str, MAVLinkMessage]]: ...
 
 
-def _spec(name, **kwds):
-    return (name, kwds)
+class UAVBoundPacketSenderFn(Protocol):
+    """Type specification for the send_packet() function of a MAVLinkUAV_
+    object.
+
+    See the documentation in `MAVLinkUAV.send_packet()` for more details.
+    """
+
+    @overload
+    def __call__(
+        self,
+        spec: MAVLinkMessageSpecification,
+        *,
+        channel: Optional[str] = None,
+    ) -> Awaitable[None]: ...
+
+    @overload
+    def __call__(
+        self,
+        spec: Optional[MAVLinkMessageSpecification],
+        *,
+        wait_for_response: tuple[str, MAVLinkMessageMatcher],
+        channel: Optional[str] = None,
+    ) -> Awaitable[MAVLinkMessage]: ...
+
+    @overload
+    def __call__(
+        self,
+        spec: Optional[MAVLinkMessageSpecification],
+        *,
+        wait_for_one_of: dict[str, MAVLinkMessageSpecification],
+        channel: Optional[str] = None,
+    ) -> Awaitable[tuple[str, MAVLinkMessage]]: ...
 
 
 class _MAVLinkMessageSpecificationFactory:
@@ -214,6 +285,12 @@ class MAVLinkNetworkSpecification:
     they are sent to the ID formatter function.
     """
 
+    network_size: int = 250
+    """Number of system IDs reserved for drones in this network. The server
+    will treat system IDs from 1 to ``network_size`` (inclusive) as drones in
+    this network.
+    """
+
     connections: list[str] = field(default_factory=list)
     """The connections that the MAVLink network will consist of. A MAVLink
     network may have one or more connections where MAVLink messages are
@@ -281,6 +358,9 @@ class MAVLinkNetworkSpecification:
         if "id_offset" in obj:
             result.id_offset = int(obj["id_offset"])
 
+        if "network_size" in obj:
+            result.network_size = int(obj["network_size"])
+
         if "connections" in obj:
             result.connections = obj["connections"]
 
@@ -318,6 +398,7 @@ class MAVLinkNetworkSpecification:
             "id": self.id,
             "id_format": self.id_format,
             "id_offset": self.id_offset,
+            "network_size": self.network_size,
             "system_id": self.system_id,
             "connections": self.connections,
             "packet_loss": self.packet_loss,

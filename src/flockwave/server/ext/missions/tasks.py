@@ -1,6 +1,6 @@
 """Background tasks managed by the mission extension."""
 
-from abc import ABCMeta, abstractmethod
+from abc import ABC, abstractmethod
 from contextlib import ExitStack, contextmanager
 from logging import Logger
 from trio import open_memory_channel, MemorySendChannel, WouldBlock
@@ -17,7 +17,7 @@ from .registry import MissionRegistry
 __all__ = ("MissionSchedulerTask", "MissionUpdateNotifierTask")
 
 
-class MissionRegistryRelatedTaskBase(metaclass=ABCMeta):
+class MissionRegistryRelatedTaskBase(ABC):
     """Base class for tasks that are related to missions in a mission registry."""
 
     log: Optional[Logger] = None
@@ -168,7 +168,7 @@ class MissionSchedulerTask(MissionRegistryRelatedTaskBase):
                 "Finished mission",
                 extra={
                     "id": mission.id,
-                    "semantics": "success" if mission.was_successful else "error",
+                    "semantics": "success" if mission.was_successful else "failure",
                 },
             )
 

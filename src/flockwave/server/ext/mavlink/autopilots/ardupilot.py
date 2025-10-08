@@ -1,15 +1,20 @@
-"""Implementations of autopilot-specific functionality."""
-
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from contextlib import aclosing
+from dataclasses import dataclass
+from functools import partial
+from io import BytesIO
+from struct import Struct
 from time import monotonic
 from trio import sleep, TooSlowError
-from typing import AsyncIterator, Type, Union, TYPE_CHECKING
+from typing import IO, AsyncIterator, Iterable, Sequence, Union, TYPE_CHECKING, cast
 
 from flockwave.server.errors import NotSupportedError
-from flockwave.server.model.commands import Progress, Suspend
+from flockwave.server.model.commands import (
+    Progress,
+    ProgressEventsWithSuspension,
+    Suspend,
+)
 from flockwave.server.model.geofence import (
     GeofenceAction,
     GeofenceConfigurationRequest,
@@ -21,7 +26,7 @@ from flockwave.server.model.safety import (
 )
 from flockwave.server.utils import clamp
 
-from .enums import (
+from ..enums import (
     MAVAutopilot,
     MAVCommand,
     MAVMessageType,
@@ -31,546 +36,23 @@ from .enums import (
     MAVState,
     MAVSysStatusSensor,
 )
-from .errors import UnknownFlightModeError
-from .ftp import MAVFTP
-from .fw_upload import FirmwareUpdateResult, FirmwareUpdateTarget
-from .geofence import GeofenceManager, GeofenceType
-from .types import MAVLinkFlightModeNumbers, MAVLinkMessage
-from .utils import (
-    decode_param_from_wire_representation,
-    encode_param_to_wire_representation,
-    log_id_for_uav,
-)
+from ..errors import UnknownFlightModeError
+from ..ftp import MAVFTP
+from ..fw_upload import FirmwareUpdateResult, FirmwareUpdateTarget
+from ..geofence import GeofenceManager, GeofenceType
+from ..types import MAVLinkFlightModeNumbers, MAVLinkMessage
+from ..utils import log_id_for_uav
 
 if TYPE_CHECKING:
-    from .driver import MAVLinkUAV
+    from ..driver import MAVLinkUAV
 
+from .base import Autopilot
+from .registry import register_for_mavlink_type
 
-class Autopilot(ABC):
-    """Interface specification and generic entry point for autopilot objects."""
+__all__ = ("ArduPilot", "ArduPilotWithSkybrush")
 
-    name = "Abstract autopilot"
 
-    def __init__(self, base=None) -> None:
-        self.capabilities = int(getattr(base, "capabilities", 0))
-
-    @staticmethod
-    def from_autopilot_type(type: int) -> Type["Autopilot"]:
-        """Returns an autopilot class suitable to represent the behaviour of
-        an autopilot with the given MAVLink autopilot identifier in the
-        heartbeat message.
-        """
-        return _autopilot_registry.get(type, UnknownAutopilot)
-
-    @classmethod
-    def from_heartbeat(cls, message: MAVLinkMessage) -> Type["Autopilot"]:
-        """Returns an autopilot class suitable to represent the behaviour of
-        an autopilot with the given MAVLink heartbeat message.
-        """
-        return cls.from_autopilot_type(message.autopilot)
-
-    @classmethod
-    def describe_mode(cls, base_mode: int, custom_mode: int) -> str:
-        """Returns the description of the current mode that the autopilot is
-        in, given the base and the custom mode in the heartbeat message.
-        """
-        if base_mode & 1:
-            # custom mode
-            return cls.describe_custom_mode(base_mode, custom_mode)
-        elif base_mode & 4:
-            # auto mode
-            return "auto"
-        elif base_mode & 8:
-            # guided mode
-            return "guided"
-        elif base_mode & 16:
-            # stabilize mode
-            return "stabilize"
-        elif base_mode & 64:
-            # manual mode
-            return "manual"
-        else:
-            # anything else
-            return "unknown"
-
-    @classmethod
-    def describe_custom_mode(cls, base_mode: int, custom_mode: int) -> str:
-        """Returns the description of the current custom mode that the autopilot
-        is in, given the base and the custom mode in the heartbeat message.
-
-        This method is called if the "custom mode" bit is set in the base mode
-        of the heartbeat.
-        """
-        return f"mode {custom_mode}"
-
-    @abstractmethod
-    def are_motor_outputs_disabled(
-        self, heartbeat: MAVLinkMessage, sys_status: MAVLinkMessage
-    ) -> bool:
-        """Decides whether the motor outputs of a UAV with this autopilot are
-        disabled, given the MAVLink HEARTBEAT and SYS_STATUS messages where this
-        information is conveyed for _some_ autopilots.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    async def calibrate_accelerometer(self, uav: MAVLinkUAV) -> AsyncIterator[Progress]:
-        """Calibrates the accelerometers of the UAV.
-
-        Yields:
-            events describing the progress of the calibration
-
-        Raises:
-            NotImplementedError: if we have not implemented support for
-                calibrating the accelerometers (but it supports accelerometer
-                calibration)
-            NotSupportedError: if the autopilot does not support accelerometer
-                calibration
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    async def calibrate_compass(self, uav: MAVLinkUAV) -> AsyncIterator[Progress]:
-        """Calibrates the compasses of the UAV.
-
-        Yields:
-            events describing the progress of the calibration
-
-        Raises:
-            NotImplementedError: if we have not implemented support for
-                calibrating compasses (but it supports compass calibration)
-            NotSupportedError: if the autopilot does not support compass
-                calibration
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def can_handle_firmware_update_target(self, target_id: str) -> bool:
-        """Returns whether the UAV can handle firmware uploads with the given
-        target.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    async def configure_geofence(
-        self, uav: MAVLinkUAV, configuration: GeofenceConfigurationRequest
-    ) -> None:
-        """Updates the geofence configuration on the autopilot to match the
-        given configuration object.
-
-        Raises:
-            NotImplementedError: if we have not implemented support for updating
-                the geofence configuration on the autopilot (but it supports
-                geofences)
-            NotSupportedError: if the autopilot does not support updating the
-                geofence or if the configuration request contains something that
-                the drone is not capable of doing (e.g., smart landing on a
-                drone that does not support collective collision avoidance)
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    async def configure_safety(
-        self, uav: MAVLinkUAV, configuration: SafetyConfigurationRequest
-    ) -> None:
-        """Updates the safety configuration on the autopilot to match the
-        given configuration object.
-
-        Raises:
-            NotImplementedError: if we have not implemented support for updating
-                the safety configuration on the autopilot (but it supports
-                safety features)
-            NotSupportedError: if the autopilot does not support updating the
-                safety or if the configuration request contains something that
-                the drone is not capable of doing
-        """
-        raise NotImplementedError
-
-    def decode_param_from_wire_representation(
-        self, value: Union[int, float], type: MAVParamType
-    ) -> float:
-        """Decodes the given MAVLink parameter value returned from a MAVLink
-        PARAM_VALUE message into its "real" value as a float.
-        """
-        return decode_param_from_wire_representation(value, type)
-
-    def encode_param_to_wire_representation(
-        self, value: Union[int, float], type: MAVParamType
-    ) -> float:
-        """Encodes the given MAVLink parameter value as a float suitable to be
-        transmitted over the wire in a MAVLink PARAM_SET command.
-        """
-        return encode_param_to_wire_representation(value, type)
-
-    @abstractmethod
-    def get_flight_mode_numbers(self, mode: str) -> MAVLinkFlightModeNumbers:
-        """Returns the numeric flight modes (mode, custom mode, custom submode)
-        corresponding to the given mode description as a string.
-
-        Raises:
-            NotImplementedError: if we have not implemented the conversion from
-                a mode string to a flight mode number set
-            UnknownFlightModeError: if the flight mode is not known to the autopilot
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    async def get_geofence_status(self, uav: MAVLinkUAV) -> GeofenceStatus:
-        """Retrieves a full geofence status object from the drone.
-
-        Parameters:
-            uav: the MAVLinkUAV object
-
-        Returns:
-            a full geofence status object
-
-        Raises:
-            NotImplementedError: if we have not implemented support for retrieving
-                the geofence status from the autopilot (but it supports
-                geofences)
-            NotSupportedError: if the autopilot does not support geofences at all
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def handle_firmware_update(
-        self, uav: MAVLinkUAV, target_id: str, blob: bytes
-    ) -> AsyncIterator[Progress]:
-        """Handles a firmware update request on the UAV.
-
-        This function is called only when the UAV is known to be able to handle
-        a firmware update with the given target ID.
-
-        Args:
-            target_id: the target ID of the firmware update
-            blob: the firmware update blob
-
-        Yields:
-            Progress_ objects to indicate the progress of the firmware update
-
-        Raises:
-            RuntimeError: if there was an error during the firmware update
-            NotImplementedError: if we have not implemented support for
-                firmware updates (but we plan to do so)
-            NotSupportedError: if the autopilot does not support firmware
-                updates
-        """
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def is_battery_percentage_reliable(self) -> bool:
-        """Returns whether the autopilot provides reliable battery capacity
-        percentages.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def is_prearm_check_in_progress(
-        self, heartbeat: MAVLinkMessage, sys_status: MAVLinkMessage
-    ) -> bool:
-        """Decides whether the prearm check is still in progress on the UAV,
-        assuming that this information is reported either in the heartbeat or
-        the SYS_STATUS message.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def is_prearm_error_message(self, text: str) -> bool:
-        """Returns whether the given text from a MAVLink STATUSTEXT message
-        indicates a prearm check error.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def is_rth_flight_mode(self, base_mode: int, custom_mode: int) -> bool:
-        """Decides whether the flight mode identified by the given base and
-        custom mode numbers is a return-to-home mode.
-        """
-        raise NotImplementedError
-
-    def process_prearm_error_message(self, text: str) -> str:
-        """Preprocesses a prearm error from a MAVLInk STATUSTEXT message,
-        identified earlier with `is_prearm_error_message()`, before it is fed
-        into the preflight check subsystem in the server. May be used to strip
-        unneeded prefixes from the message.
-
-        The default implementation returns the message as is.
-        """
-        return text
-
-    def refine_with_capabilities(self, capabilities: int):
-        """Refines the autopilot class with further information from the
-        capabilities bitfield of the MAVLink "autopilot capabilities" message,
-        returning a new autopilot instance if the autopilot type can be narrowed
-        further by looking at the capabilities.
-        """
-        self.capabilities = capabilities
-        return self
-
-    @property
-    @abstractmethod
-    def supports_local_frame(self) -> bool:
-        """Returns whether the autopilot understands MAVLink commands sent in
-        a local coordinate frame.
-        """
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def supports_repositioning(self) -> bool:
-        """Returns whether the autopilot understands the MAVLink MAV_CMD_DO_REPOSITION
-        command.
-        """
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def supports_scheduled_takeoff(self) -> bool:
-        """Returns whether the autopilot supports scheduled takeoffs."""
-        raise NotImplementedError
-
-
-class UnknownAutopilot(Autopilot):
-    """Class representing an autopilot that we do not know."""
-
-    name = "Unknown autopilot"
-
-    async def calibrate_accelerometer(self, uav: MAVLinkUAV) -> AsyncIterator[Progress]:
-        raise NotSupportedError
-
-    async def calibrate_compass(self, uav: MAVLinkUAV) -> AsyncIterator[Progress]:
-        raise NotSupportedError
-
-    def can_handle_firmware_update_target(self, target_id: str) -> bool:
-        return False
-
-    async def configure_geofence(
-        self, uav: MAVLinkUAV, configuration: GeofenceConfigurationRequest
-    ) -> None:
-        raise NotSupportedError
-
-    async def configure_safety(
-        self, uav: MAVLinkUAV, configuration: SafetyConfigurationRequest
-    ) -> None:
-        raise NotSupportedError
-
-    def are_motor_outputs_disabled(
-        self, heartbeat: MAVLinkMessage, sys_status: MAVLinkMessage
-    ) -> bool:
-        return False
-
-    def get_flight_mode_numbers(self, mode: str) -> MAVLinkFlightModeNumbers:
-        raise NotSupportedError
-
-    async def get_geofence_status(self, uav: MAVLinkUAV) -> GeofenceStatus:
-        raise NotSupportedError
-
-    async def handle_firmware_update(
-        self, uav: MAVLinkUAV, target_id: str, blob: bytes
-    ) -> None:
-        raise NotSupportedError
-
-    @property
-    def is_battery_percentage_reliable(self) -> bool:
-        # Let's be optimistic :)
-        return True
-
-    def is_prearm_error_message(self, text: str) -> bool:
-        return False
-
-    def is_prearm_check_in_progress(
-        self, heartbeat: MAVLinkMessage, sys_status: MAVLinkMessage
-    ) -> bool:
-        return False
-
-    def is_rth_flight_mode(self, base_mode: int, custom_mode: int) -> bool:
-        return False
-
-    @property
-    def supports_local_frame(self) -> bool:
-        # Let's be pessimistic :(
-        return False
-
-    @property
-    def supports_repositioning(self) -> bool:
-        return False
-
-    @property
-    def supports_scheduled_takeoff(self):
-        return False
-
-
-class PX4(Autopilot):
-    """Class representing the PX4 autopilot firmware."""
-
-    name = "PX4"
-
-    #: Custom mode dictionary, containing the primary name and the aliases for
-    #: each known main flight mode. The primary name should be from one of the
-    #: constants in the FlightMode enum of the Flockwave spec
-    _main_modes = {
-        1: ("manual",),
-        2: ("alt", "alt hold"),
-        3: ("pos", "pos hold"),
-        4: ("auto",),
-        5: ("acro",),
-        6: ("guided", "offboard"),
-        7: ("stab", "stabilize"),
-        8: ("rattitude",),
-        9: ("simple",),
-    }
-
-    #: Custom mode dictionary, containing the primary name and the aliases for
-    #: each known submode of the "auto" flight mode
-    _auto_submodes = {
-        2: ("takeoff",),
-        3: ("loiter",),
-        4: ("mission",),
-        5: ("rth",),
-        6: ("land",),
-        8: ("follow",),
-        9: ("precland",),
-    }
-
-    #: Mapping from mode names to the corresponding basemode / mode / submode
-    #: triplets
-    _mode_names_to_numbers = {
-        "manual": (MAVModeFlag.CUSTOM_MODE_ENABLED, 1, 0),
-        "althold": (MAVModeFlag.CUSTOM_MODE_ENABLED, 2, 0),
-        "poshold": (MAVModeFlag.CUSTOM_MODE_ENABLED, 3, 0),
-        "auto": (MAVModeFlag.CUSTOM_MODE_ENABLED, 4, 0),
-        "takeoff": (MAVModeFlag.CUSTOM_MODE_ENABLED, 4, 2),
-        "loiter": (MAVModeFlag.CUSTOM_MODE_ENABLED, 4, 3),
-        "mission": (MAVModeFlag.CUSTOM_MODE_ENABLED, 4, 4),
-        "rth": (MAVModeFlag.CUSTOM_MODE_ENABLED, 4, 5),
-        "rtl": (MAVModeFlag.CUSTOM_MODE_ENABLED, 4, 5),
-        "land": (MAVModeFlag.CUSTOM_MODE_ENABLED, 4, 6),
-        "follow": (MAVModeFlag.CUSTOM_MODE_ENABLED, 4, 8),
-        "precland": (MAVModeFlag.CUSTOM_MODE_ENABLED, 4, 9),
-        "acro": (MAVModeFlag.CUSTOM_MODE_ENABLED, 5, 0),
-        "guided": (MAVModeFlag.CUSTOM_MODE_ENABLED, 6, 0),
-        "offboard": (MAVModeFlag.CUSTOM_MODE_ENABLED, 6, 0),
-        "stab": (MAVModeFlag.CUSTOM_MODE_ENABLED, 7, 0),
-        "stabilize": (MAVModeFlag.CUSTOM_MODE_ENABLED, 7, 0),
-        "rattitude": (MAVModeFlag.CUSTOM_MODE_ENABLED, 8, 0),
-    }
-
-    @classmethod
-    def describe_custom_mode(cls, base_mode: int, custom_mode: int) -> str:
-        main_mode = (custom_mode & 0x00FF0000) >> 16
-        submode = (custom_mode & 0xFF000000) >> 24
-        main_mode_name = cls._main_modes.get(main_mode)
-
-        if main_mode_name:
-            main_mode_name = main_mode_name[0]
-
-            if main_mode == 3:
-                # "pos hold" has a "circle" submode
-                if submode == 1:
-                    return "circle"
-
-            elif main_mode == 4:
-                # ready (1), takeoff, loiter, mission, RTL, land, unused, follow,
-                # precland
-                submode_name = cls._auto_submodes.get(submode)
-                if submode_name:
-                    return submode_name[0]
-
-            return main_mode_name
-
-        else:
-            submode = (custom_mode & 0xFF000000) >> 24
-            return f"{main_mode:02X}{submode:02X}"
-
-    def are_motor_outputs_disabled(
-        self, heartbeat: MAVLinkMessage, sys_status: MAVLinkMessage
-    ) -> bool:
-        # It seems like PX4 is not reporting the status of the safety switch
-        # anywhere
-        return False
-
-    async def calibrate_accelerometer(self, uav: MAVLinkUAV) -> AsyncIterator[Progress]:
-        raise NotImplementedError
-
-    async def calibrate_compass(self, uav: MAVLinkUAV) -> AsyncIterator[Progress]:
-        raise NotImplementedError
-
-    def can_handle_firmware_update_target(self, target_id: str) -> bool:
-        return False
-
-    async def configure_geofence(
-        self, uav: MAVLinkUAV, configuration: GeofenceConfigurationRequest
-    ) -> None:
-        raise NotImplementedError
-
-    async def configure_safety(
-        self, uav: MAVLinkUAV, configuration: SafetyConfigurationRequest
-    ) -> None:
-        raise NotImplementedError
-
-    def get_flight_mode_numbers(self, mode: str) -> MAVLinkFlightModeNumbers:
-        mode = mode.lower().replace(" ", "")
-        numbers = self._mode_names_to_numbers.get(mode)
-        if numbers is None:
-            raise UnknownFlightModeError(mode)
-
-        return numbers
-
-    async def get_geofence_status(self, uav: MAVLinkUAV) -> GeofenceStatus:
-        raise NotImplementedError
-
-    async def handle_firmware_update(
-        self, uav: MAVLinkUAV, target_id: str, blob: bytes
-    ) -> None:
-        raise NotSupportedError
-
-    @property
-    def is_battery_percentage_reliable(self) -> bool:
-        """Returns whether the autopilot provides reliable battery capacity
-        percentages.
-        """
-        return True
-
-    def is_prearm_check_in_progress(
-        self, heartbeat: MAVLinkMessage, sys_status: MAVLinkMessage
-    ) -> bool:
-        mask = MAVSysStatusSensor.PREARM_CHECK.value
-        if (
-            sys_status.onboard_control_sensors_present
-            & sys_status.onboard_control_sensors_enabled
-            & mask
-        ):
-            return not bool(sys_status.onboard_control_sensors_health & mask)
-        else:
-            return False
-
-    def is_prearm_error_message(self, text: str) -> bool:
-        return text.startswith("Preflight ")
-
-    def is_rth_flight_mode(self, base_mode: int, custom_mode: int) -> bool:
-        # base mode & 1 is "custom mode", 0x04 is the "auto" custom main mode,
-        # 0x05 is the "rth" submode of the auto custom main mode
-        return bool(base_mode & 1) and custom_mode & 0xFFFF0000 == 0x05040000
-
-    def process_prearm_error_message(self, text: str) -> str:
-        prefix, sep, suffix = text.partition(":")
-        return suffix.strip() if sep else text
-
-    @property
-    def supports_local_frame(self) -> bool:
-        # https://github.com/PX4/PX4-Autopilot/issues/10246
-        return False
-
-    @property
-    def supports_repositioning(self) -> bool:
-        return True
-
-    @property
-    def supports_scheduled_takeoff(self):
-        return False
-
-
+@register_for_mavlink_type(MAVAutopilot.ARDUPILOTMEGA)
 class ArduPilot(Autopilot):
     """Class representing the ArduPilot autopilot firmware."""
 
@@ -652,7 +134,9 @@ class ArduPilot(Autopilot):
         else:
             return False
 
-    async def calibrate_accelerometer(self, uav: MAVLinkUAV) -> AsyncIterator[Progress]:
+    async def calibrate_accelerometer(
+        self, uav: MAVLinkUAV
+    ) -> ProgressEventsWithSuspension[None, str]:
         # Reset our internal state object of the accelerometer calibration procedure
         uav.accelerometer_calibration.reset()
 
@@ -713,7 +197,9 @@ class ArduPilot(Autopilot):
 
         yield Progress.done("Acceelerometer calibration successful.")
 
-    async def calibrate_compass(self, uav: MAVLinkUAV) -> AsyncIterator[Progress]:
+    async def calibrate_compass(
+        self, uav: MAVLinkUAV
+    ) -> ProgressEventsWithSuspension[None, str]:
         calibration_messages = {
             int(MAVMessageType.MAG_CAL_PROGRESS): 1.0,
             int(MAVMessageType.MAG_CAL_REPORT): 1.0,
@@ -742,8 +228,9 @@ class ArduPilot(Autopilot):
                 async for progress in uav.compass_calibration.updates(
                     timeout=timeout, fail_on_timeout=False
                 ):
-                    if progress.percentage == 100:
-                        success = True
+                    if isinstance(progress, Progress):
+                        if progress.percentage == 100:
+                            success = True
                     yield progress
 
         except TooSlowError:
@@ -1073,6 +560,12 @@ class ArduPilot(Autopilot):
     def is_rth_flight_mode(self, base_mode: int, custom_mode: int) -> bool:
         return bool(base_mode & 1) and (custom_mode == 6 or custom_mode == 21)
 
+    def prepare_mavftp_parameter_upload(
+        self, parameters: dict[str, float]
+    ) -> tuple[str, bytes]:
+        data = encode_parameters_to_packed_format(parameters)
+        return "@PARAM/param.pck", data
+
     def process_prearm_error_message(self, text: str) -> str:
         return text[8:]
 
@@ -1084,7 +577,7 @@ class ArduPilot(Autopilot):
         ):
             mask = ArduPilotWithSkybrush.CAPABILITY_MASK
             if (capabilities & mask) == mask:
-                result = ArduPilotWithSkybrush(self)
+                result = ArduPilotWithSkybrush(self)  # pyright: ignore[reportAbstractUsage]
 
         return result
 
@@ -1097,6 +590,10 @@ class ArduPilot(Autopilot):
 
     @property
     def supports_local_frame(self) -> bool:
+        return True
+
+    @property
+    def supports_mavftp_parameter_upload(self) -> bool:
         return True
 
     @property
@@ -1166,7 +663,224 @@ class ArduPilotWithSkybrush(ArduPilot):
         return True
 
 
-_autopilot_registry: dict[int, Type[Autopilot]] = {
-    MAVAutopilot.ARDUPILOTMEGA: ArduPilot,
-    MAVAutopilot.PX4: PX4,
+################################################################################
+## ArduPilot packed parameter format handling
+################################################################################
+
+
+@dataclass
+class PackedParameter:
+    """A single entry in an ArduPilot-specific packed parameter representation."""
+
+    name: bytes
+    """Name of the parameter."""
+
+    type: MAVParamType | None
+    """Type of the parameter in the packed representation. Not necessarily the
+    same as the type of the parameter in the onboard storage; ArduPilot will
+    convert between the two if needed.
+    """
+
+    value: float
+    """The value of the parameter."""
+
+    default_value: float | None = None
+    """The default value of the parameter, if known. Can be left empty if you
+    want to _encode_ parameters into a packed representation instead of
+    decoding them.
+    """
+
+
+_packed_param_header = Struct("<HHH")
+_packed_type_to_mav_type: list[int] = [
+    0,
+    MAVParamType.INT8,
+    MAVParamType.INT16,
+    MAVParamType.INT32,
+    MAVParamType.REAL32,
+] + [0] * 11
+_mav_type_to_packed_type: dict[MAVParamType, int] = {
+    MAVParamType.INT8: 1,
+    MAVParamType.INT16: 2,
+    MAVParamType.INT32: 3,
+    MAVParamType.REAL32: 4,
 }
+_packed_param_formats: list[Struct | None] = [
+    None,
+    Struct("<b"),
+    Struct("<h"),
+    Struct("<i"),
+    Struct("<f"),
+] + [None] * 11
+
+
+def decode_parameters_from_packed_format(
+    data: bytes | IO[bytes],
+) -> Iterable[PackedParameter]:
+    """Decodes an ArduPilot packed parameter bundle into an iterable of
+    PackedParameter_ instances.
+
+    The input must be a packed parameter bundle retrieved from the vehicle
+    by downloading ``@PARAM/param.pck`` via MAVFTP. See the following file for
+    more details:
+
+    https://github.com/ArduPilot/ardupilot/blob/master/libraries/AP_Filesystem/README.md
+
+    Args:
+        data: the packed parameter bundle as a bytes object or as a readable
+            stream
+
+    Yields:
+        PackedParameter_ instances decoded from the packed parameter bundle.
+    """
+    fp: IO[bytes] = BytesIO(data) if isinstance(data, bytes) else cast(IO[bytes], data)
+
+    header_bytes = fp.read(_packed_param_header.size)
+
+    magic: int
+    num_params: int
+
+    magic, num_params, _ = _packed_param_header.unpack(header_bytes)
+
+    if magic != 0x671B and magic != 0x671C:
+        raise RuntimeError("invalid magic bytes in packed param stream")
+
+    has_defaults = magic == 0x671C
+
+    prev_name = b""
+
+    reader = partial(fp.read, 1)
+
+    for _ in range(num_params):
+        # Skip leading zeros
+        for byte in iter(reader, b""):
+            val = ord(byte)
+            if val:
+                type = val & 0x0F
+                flags = (val & 0xF0) >> 4
+                break
+        else:
+            # End of file, stop iteration
+            break
+
+        byte = reader()
+        common_length, length = ord(byte) & 0x0F, (ord(byte) >> 4) + 1
+
+        name = prev_name[:common_length] + fp.read(length)
+        param_type: MAVParamType = MAVParamType(_packed_type_to_mav_type[type])
+        struct = _packed_param_formats[type]
+        value = struct.unpack(fp.read(struct.size)) if struct else None
+
+        if has_defaults:
+            if flags & 0x01:
+                # Default value also provided
+                default_value = struct.unpack(fp.read(struct.size)) if struct else None
+            else:
+                # Parameter is at its default value
+                default_value = value
+        else:
+            default_value = None
+
+        if value is not None:
+            yield PackedParameter(
+                name,
+                param_type,
+                value[0],
+                default_value[0] if default_value is not None else None,
+            )
+
+        prev_name = name
+
+
+def _propose_mav_type_for_value(value: float) -> MAVParamType:
+    if value.is_integer():
+        if -128 <= value <= 127:
+            return MAVParamType.INT8
+        elif -32768 <= value <= 32767:
+            return MAVParamType.INT16
+        elif -2147483648 <= value <= 2147483647:
+            return MAVParamType.INT32
+    return MAVParamType.REAL32
+
+
+def encode_parameters_to_packed_format(
+    parameters: Sequence[PackedParameter] | dict[str, float],
+) -> bytes:
+    """Encodes a sequence of PackedParameter_ instances into a packed parameter
+    bundle that is suitable for uploading to `@PARAM/param.pck` via MAVFTP.
+
+    Default values are ignored in the input. You may also provide a dict of
+    name-value pairs.
+
+    Note that the decoding and the encoding process is not symmetric. During
+    encoding, the `total_length` field in the header is the total length of the
+    bundle, in bytes. During decoding, the field contains the total number of
+    parameters on the vehicle.
+
+    Args:
+        parameters: the PackedParameter_ instances or name-value pairs to encode
+
+    Returns:
+        The packed parameter bundle as a bytes object.
+    """
+    buf: list[bytes] = []
+
+    # We don't know the total length yet so encode it as zero
+    buf.append(_packed_param_header.pack(0x671B, len(parameters), 0))
+
+    # Construct the parameter iterator
+    if isinstance(parameters, dict):
+        param_iter = (
+            PackedParameter(name.upper().encode("ascii", "replace"), None, float(value))
+            for name, value in parameters.items()
+        )
+    else:
+        param_iter = iter(parameters)
+
+    prev_name = b""
+
+    for param in sorted(param_iter, key=lambda p: p.name.upper()):
+        name = param.name
+        if len(name) > 16:
+            raise RuntimeError(f"Parameter name too long: {name!r}")
+
+        mav_type = param.type or _propose_mav_type_for_value(param.value)
+        packed_type = _mav_type_to_packed_type[mav_type]
+
+        # Find length of longest common prefix of name and prev_name
+        for i, (a, b) in enumerate(zip(name, prev_name, strict=False)):
+            if a != b:
+                common_len = i
+                break
+        else:
+            # Since the iterator is sorted by name, this can happen only if
+            # we have duplicate names or if prev_name is a prefix of name
+            if name == prev_name:
+                raise RuntimeError(f"Duplicate parameter name: {param.name!r}")
+            else:
+                common_len = len(prev_name)
+
+        assert common_len < 16
+        name_len = len(name) - common_len
+        encoded_length = common_len | ((name_len - 1) << 4)
+
+        buf.append(bytes([packed_type, encoded_length]))
+        buf.append(name[common_len:])
+
+        param_format = _packed_param_formats[packed_type]
+        assert param_format is not None
+
+        value = (
+            int(param.value) if mav_type != MAVParamType.REAL32 else float(param.value)
+        )
+        buf.append(param_format.pack(value))
+
+        prev_name = name
+
+    total_length = sum(len(x) for x in buf)
+    if total_length > 65535:
+        raise RuntimeError(f"Packed parameter bundle too large: {total_length} bytes")
+
+    # Now we can re-encode the header
+    buf[0] = _packed_param_header.pack(0x671B, len(parameters), total_length)
+    return b"".join(buf)
