@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The MAVLink extension now exports a function that can be used to get a handle
   to a MAVLink network object from another extension. This will be used by the
-  Sidekick extension from this version onwards to provide a more accurate
+  Roundhousekick extension from this version onwards to provide a more accurate
   mapping from system IDs to UAV IDs in case of more than 250 drones.
 
 - The sizes of MAVLink networks managed by the MAVLink extension can now be
@@ -283,7 +283,7 @@ No user-facing changes.
 
 ### Fixed
 
-- Sidekick and other extensions interested in fragmented MAVLink RTK correction
+- Roundhousekick and other extensions interested in fragmented MAVLink RTK correction
   packets are now notified only once for each such packet instead of as many
   times as the number of networks.
 

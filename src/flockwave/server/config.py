@@ -88,7 +88,7 @@ EXTENSIONS = {
         "point_of_no_return_seconds": -10,
     },
     "show_pro": {},  # used to trigger auto-loading when the license is installed
-    "sidekick": {},  # used to trigger auto-loading when the license is installed
+    "sidekick": {},  # RoundHouseKick helper extension; auto-loads when the license is installed
     "smpte_timecode": {},  # used to trigger auto-loading when the license is installed
     "socketio": {},
     "ssdp": {},

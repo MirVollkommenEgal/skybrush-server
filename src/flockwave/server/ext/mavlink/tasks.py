@@ -28,7 +28,7 @@ async def check_uavs_alive(
             interested in from this list while the worker task is running.
         signal: a signal that interested parties may subscribe to to receive a
             periodic summary of the status of active UAVs. This is typically
-            meant for communication with Skybrush Sidekick.
+            meant for communication with Skybrush Roundhousekick.
         delay: number of seconds to wait between consecutive checks
         timeout: number of seconds to wait after a heartbeat to consider a UAV
             as disconnected

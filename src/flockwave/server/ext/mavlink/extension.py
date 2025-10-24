@@ -168,19 +168,22 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         # is not running yet
         uavs = []
 
+        # Create an object responsible for distributing RTK correction packets
+        # to other extensions that are interested in them
+        rtk_correction_packet_signal_manager = RTKCorrectionPacketSignalManager()
+
+        rtk_packet_fragments_signal = signals.get("mavlink:rtk_fragments")
+
         # Create a list of arguments to pass to `network.run()` for each MAVLink
         # network that the extension manages
         kwds = {
             "driver": self._driver,
             "log": self.log,
             "register_uav": self._register_uav,
+            "rtk_packet_fragments_signal": rtk_packet_fragments_signal,
             "supervisor": app.supervise,
             "use_connection": app.connection_registry.use,
         }
-
-        # Create an object responsible for distributing RTK correction packets
-        # to other extensions that are interested in them
-        rtk_correction_packet_signal_manager = RTKCorrectionPacketSignalManager()
 
         # Create a cleanup context and run the extension
         with ExitStack() as stack:
@@ -225,7 +228,7 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                     # Create an additional task that periodically checks whether the UAVs
                     # registered in the extension are still alive, and that sends
                     # status summary signals to interested consumers (typically
-                    # the sidekick extension)
+                    # the roundhousekick extension)
                     nursery.start_soon(
                         check_uavs_alive, uavs, status_summary_signal, self.log
                     )
@@ -399,7 +402,7 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 network.enqueue_rtk_correction_packet(packet)
             except Exception:
                 if self.log:
-                    self.log.warning(
+                    self.log.warn(
                         f"Failed to enqueue RTK correction packet to network {name!r}"
                     )
 

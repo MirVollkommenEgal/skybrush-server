@@ -1,29 +1,46 @@
 {
-    "EXTENSIONS": {
-        // Make the server listen on all network interfaces
-        "http_server": {
-            "host": ""
-        },
-        "location": {
-            "fixed": {
-                "position": [
-                    52.400000,
-                    13.060000,
-                    40.0
-                ],
-                "accuracy": 1
-            }
-        },
-        // RTK extension configuration
-        "rtk": {
-            "enabled": true,
-            "presets": {
-                "NTRIPConnection": {
-                    "source": Philipp_SAPOS_BB,
-                    "title": "Example NTRIP provider",
-                    "format": "auto",
-                },
-            }
+  "EXTENSIONS": {
+    "http_server": {
+      "host": "",
+      "port": 5005
+    },
+    "location": {
+      "fixed": {
+        "accuracy": 1,
+        "position": [
+          52.4,
+          13.06,
+          40.0
+        ]
+      }
+    },
+    "mavlink": {
+      "enabled": true,
+      "networks": {
+        "mav": {
+          "connections": [
+            "udp-listen://:14550?broadcast_port=14555"
+          ],
+          "id_format": "{0:02}",
+          "rssi_mode": "radio_status",
+          "statustext_targets": {
+            "client": "debug",
+            "log_prearm": false,
+            "server": "notice"
+          },
+          "system_id": 254
         }
+      }
+    },
+    "rtk": {
+      "enabled": true,
+      "presets": {
+        "NTRIPConnection": {
+          "format": "auto",
+          "source": "ntrip://saposbln856-1:ph25ja@www.sapos-be-ntrip.de:2101/VRS_3_4G_BE",
+          "title": "My NTRIP Source"
+        }
+      }
     }
+  }
 }

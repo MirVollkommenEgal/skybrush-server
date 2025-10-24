@@ -21,11 +21,22 @@ BASE_PORT: int = 5000
 number are derived by adding the relative port number to the base port.
 """
 
+SIDEKICK_SERVICE = "sidekick"
+ROUNDHOUSEKICK_ALIAS = "roundhousekick"
+
+
+def _normalize_service_name(service: str) -> str:
+    """Return the canonical service name, accepting legacy aliases."""
+    if service == ROUNDHOUSEKICK_ALIAS:
+        return SIDEKICK_SERVICE
+    return service
+
+
 SERVICE_MAP: dict[str, PortSpec] = {
     "http": ("relative", 0),
     "tcp": ("relative", 1),
     "udp": ("relative", 1),
-    "sidekick": ("relative", 2),
+    SIDEKICK_SERVICE: ("relative", 2),
     "rcin": ("relative", 3),
     "ssdp": ("absolute", 1900),
 }
@@ -91,6 +102,8 @@ def suggest_port_number_for_service(
     """
     global _BASE_PORT_USED
 
+    service = _normalize_service_name(service)
+
     try:
         port_type, value = SERVICE_MAP[service]
     except KeyError:
@@ -140,6 +153,8 @@ def set_base_port(value: int) -> None:
 def use_port(service: str, port: int) -> Iterator[None]:
     """Context manager that registers a port as being used by a service."""
     global _registered_ports
+
+    service = _normalize_service_name(service)
 
     if service in _registered_ports:
         raise RuntimeError(f"service already registered: {service!r}")
