@@ -472,7 +472,9 @@ class MAVLinkNetwork:
         """
         await self.manager.broadcast_packet(spec, destination=channel)
 
-    def enqueue_rc_override_packet(self, channels: list[int]) -> None:
+    def enqueue_rc_override_packet(
+        self, channels: list[int], target_system: int = 0
+    ) -> None:
         """Handles a list of a RC channels that the server wishes to forward
         to the drones as RC override.
 
@@ -480,8 +482,17 @@ class MAVLinkNetwork:
             channels: the values of the RC channels to send in a MAVLink
                 `RC_CHANNELS_OVERRIDE` message
         """
+        if self.log:
+            self.log.info(
+                "Enqueuing RC_CHANNELS_OVERRIDE on network %s: target_system=%s "
+                "channels=%r",
+                self.id,
+                target_system,
+                channels,
+            )
+
         message = spec.rc_channels_override(
-            target_system=0,
+            target_system=target_system,
             target_component=0,
             chan1_raw=channels[0],
             chan2_raw=channels[1],
@@ -505,6 +516,31 @@ class MAVLinkNetwork:
         self.manager.enqueue_broadcast_packet(
             message, destination=Channel.RC, allow_failure=True
         )
+
+    def enqueue_rc_override_packet_for_uav(
+        self, uav_id: str, channels: list[int]
+    ) -> bool:
+        """Enqueues an RC override packet for a single UAV in this network."""
+        for system_id, uav in self._uavs.items():
+            if uav.id == uav_id:
+                if self.log:
+                    self.log.info(
+                        "Routing RC override to UAV %r on network %s with "
+                        "MAVLink system ID %s",
+                        uav_id,
+                        self.id,
+                        system_id,
+                    )
+                self.enqueue_rc_override_packet(channels, target_system=system_id)
+                return True
+        if self.log:
+            self.log.warning(
+                "Could not find UAV %r in MAVLink network %s; known UAVs: %r",
+                uav_id,
+                self.id,
+                [uav.id for uav in self._uavs.values()],
+            )
+        return False
 
     def enqueue_rtk_correction_packet(self, packet: bytes) -> None:
         """Handles an RTK correction packet that the server wishes to forward

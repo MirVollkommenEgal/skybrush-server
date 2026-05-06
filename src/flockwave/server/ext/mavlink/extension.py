@@ -369,21 +369,34 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
             channels = [0] * 8 + [65534] * 10
         else:
             # Get scaled PWM values to send
-            channels = sender.get_scaled_channel_values_int(out_of_range=0)
+            channels = sender.get_scaled_channel_values_int(out_of_range=65535)
             if sender.num_channels < 18:
                 # Ignore channels for which the sender has no real value.
                 # 65535 in MAVLink RC_CHANNELS_OVERRIDE packets means "ignore"
                 num_missing = 18 - sender.num_channels
                 channels[sender.num_channels :] = [65535] * num_missing
 
+        target_id = sender.target_id
+        handled = False
+
         for name, network in self._networks.items():
             try:
-                network.enqueue_rc_override_packet(channels)
+                if target_id:
+                    handled = (
+                        network.enqueue_rc_override_packet_for_uav(target_id, channels)
+                        or handled
+                    )
+                else:
+                    network.enqueue_rc_override_packet(channels)
+                    handled = True
             except Exception:
                 if self.log:
                     self.log.warning(
                         f"Failed to enqueue RC override packet to network {name!r}"
                     )
+
+        if target_id and not handled and self.log:
+            self.log.warning(f"Could not route RC override to UAV {target_id!r}")
 
     def _on_rtk_correction_packet(self, sender, packet: bytes):
         """Handles an RTK correction packet that the server wishes to forward

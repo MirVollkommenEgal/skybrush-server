@@ -8,7 +8,7 @@ values of the RC channels.
 
 from logging import Logger
 
-from typing import Any, ClassVar, Optional, Sequence
+from typing import Any, Callable, ClassVar, Optional, Sequence
 
 
 rc_changed_signal: Any = None
@@ -21,6 +21,9 @@ debug: bool = False
 
 logger: Optional[Logger] = None
 """Logger instance used by the extension"""
+
+message_handler_disposer: Optional[Callable[[], None]] = None
+"""Function used to unregister message handlers installed by this extension."""
 
 
 class RCState(Sequence[int]):
@@ -48,6 +51,9 @@ class RCState(Sequence[int]):
     Zero means that RC reception is assumed to be lost.
     """
 
+    target_id: Optional[str]
+    """Optional Skybrush UAV ID targeted by the current RC override."""
+
     def __init__(self):
         """Constructor."""
         self.reset()
@@ -73,7 +79,7 @@ class RCState(Sequence[int]):
             out_of_range: the value to return for invalid RC channel values
         """
         raw_value = self.channels[index]
-        if raw_value < 0 or raw_value > 65535:
+        if raw_value < 0 or raw_value >= 65535:
             return out_of_range
         else:
             return min + span * (raw_value / 65535)
@@ -92,7 +98,7 @@ class RCState(Sequence[int]):
         result: list[float] = []
 
         for raw_value in self.channels:
-            if raw_value < 0 or raw_value > 65535:
+            if raw_value < 0 or raw_value >= 65535:
                 result.append(out_of_range)
             else:
                 result.append(min + span * (raw_value / 65535))
@@ -116,7 +122,7 @@ class RCState(Sequence[int]):
         result: list[int] = []
 
         for raw_value in self.channels:
-            if raw_value < 0 or raw_value > 65535:
+            if raw_value < 0 or raw_value >= 65535:
                 result.append(out_of_range)
             else:
                 result.append(min + round(span * (raw_value / 65535)))
@@ -128,12 +134,13 @@ class RCState(Sequence[int]):
         """Returns whether the RC connection is assumed to be lost."""
         return self.num_channels <= 0
 
-    def reset(self) -> None:
+    def reset(self, target_id: Optional[str] = None) -> None:
         """Invalidates all RC channels."""
         self.channels = [-1] * self.MAX_CHANNEL_COUNT
         self.num_channels = 0
+        self.target_id = target_id
 
-    def update(self, values: Sequence[int]) -> None:
+    def update(self, values: Sequence[int], target_id: Optional[str] = None) -> None:
         """Updates the channel values of the object."""
         num_values = len(values)
         if num_values > self.MAX_CHANNEL_COUNT:
@@ -142,6 +149,7 @@ class RCState(Sequence[int]):
         else:
             self.channels[:num_values] = values
             self.num_channels = num_values
+        self.target_id = target_id
 
 
 rc = RCState()
@@ -149,7 +157,7 @@ rc = RCState()
 
 
 def load(app, configuration, log):
-    global rc_changed_signal, debug, logger
+    global rc_changed_signal, debug, logger, message_handler_disposer
 
     logger = log
 
@@ -160,35 +168,83 @@ def load(app, configuration, log):
     if debug:
         rc_changed_signal.connect(print_debug_info)
 
+    message_handler_disposer = app.message_hub.register_message_handler(
+        handle_X_RC_OVERRIDE, ["X-RC-OVERRIDE"]
+    )
+
 
 def unload():
-    global rc_changed_signal, debug, logger
+    global rc_changed_signal, debug, logger, message_handler_disposer
 
     if debug:
         rc_changed_signal.disconnect(print_debug_info)
 
+    if message_handler_disposer:
+        message_handler_disposer()
+
+    message_handler_disposer = None
     rc_changed_signal = None
     logger = None
 
 
-def notify(values: Sequence[int]):
+def notify(values: Sequence[int], target_id: Optional[str] = None):
     """Function that is to be called by extensions implementing support for
     a particular RC protocol when they wish to update the values of the RC
     channels.
     """
     global rc
-    rc.update(values)
+    rc.update(values, target_id=target_id)
+    if debug and logger:
+        logger.info(
+            "RC override update: target=%r channels=%r",
+            target_id,
+            list(values),
+        )
     rc_changed_signal.send(rc)
 
 
-def notify_lost():
+def notify_lost(target_id: Optional[str] = None):
     """Function that is to be called by extensions implementing support for
     a particular RC protocol when they wish to report that RC connection was
     lost and all RC channels should be reset to invalid values.
     """
     global rc
-    rc.reset()
+    rc.reset(target_id=target_id)
+    if debug and logger:
+        logger.info("RC override release: target=%r", target_id)
     rc_changed_signal.send(rc)
+
+
+def handle_X_RC_OVERRIDE(message, sender, hub):
+    """Handles RC override packets submitted by a Skybrush Live client."""
+    try:
+        target_id = message.body.get("uavId")
+        if not isinstance(target_id, str) or not target_id:
+            raise ValueError("uavId must name exactly one target UAV")
+
+        active = bool(message.body.get("active", True))
+        if not active:
+            notify_lost(target_id=target_id)
+            return hub.acknowledge(message)
+
+        channels = message.body.get("channels")
+        if not isinstance(channels, list):
+            raise ValueError("channels must be an array")
+        if len(channels) < 4 or len(channels) > RCState.MAX_CHANNEL_COUNT:
+            raise ValueError("channels must contain 4 to 18 values")
+
+        values = []
+        for index, value in enumerate(channels):
+            if not isinstance(value, int) or value < 0 or value > 65535:
+                raise ValueError(
+                    f"channel {index + 1} must be an integer between 0 and 65535"
+                )
+            values.append(value)
+
+        notify(values, target_id=target_id)
+        return hub.acknowledge(message)
+    except Exception as ex:
+        return hub.acknowledge(message, outcome=False, reason=str(ex))
 
 
 def print_debug_info(sender: RCState) -> None:
