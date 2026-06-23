@@ -25,7 +25,11 @@ from flockwave.gps.enums import GNSSType
 from flockwave.gps.formatting import format_gps_coordinate_as_nmea_gga_message
 from flockwave.gps.rtk import RTKMessageSet, RTKSurveySettings
 from flockwave.gps.ubx.rtk_config import UBXRTKBaseConfigurator
-from flockwave.gps.vectors import ECEFToGPSCoordinateTransformation, GPSCoordinate
+from flockwave.gps.vectors import (
+    ECEFCoordinate,
+    ECEFToGPSCoordinateTransformation,
+    GPSCoordinate,
+)
 from flockwave.server.ext.base import Extension
 from flockwave.server.message_handlers import (
     create_mapper,
@@ -47,6 +51,12 @@ from flockwave.server.utils.serial import (
 )
 
 from .beacon_manager import RTKBeaconManager
+from .allystar import (
+    AllystarParserDecorator,
+    AllystarRTKBaseConfigurator,
+    average_ecef_coordinates,
+    distance_between_ecef_coordinates,
+)
 from .clock_sync import GPSClockSynchronizationValidator
 from .enums import MessageSet, RTKConfigurationPresetType
 from .preset import (
@@ -207,6 +217,16 @@ class RTKPresetRequest:
     def touch(self) -> None:
         """Updates the timestamp of the request to the current timestamp."""
         self.timestamp = monotonic()
+
+
+@dataclass
+class NTRIPSurveyResult:
+    """Result of an NTRIP-assisted static base position estimate."""
+
+    position: ECEFCoordinate
+    accuracy: float
+    duration: float
+    sample_count: int
 
 
 class RTKExtension(Extension):
@@ -890,7 +910,15 @@ class RTKExtension(Extension):
 
             need_survey = position is None
 
-            configurator = UBXRTKBaseConfiguratorWithValset(self._survey_settings)
+            is_allystar = preset.base_type == "allystar"
+            configurator = (
+                AllystarRTKBaseConfigurator(
+                    self._survey_settings,
+                    enable_moving_base_messages=preset.allystar_moving_base,
+                )
+                if is_allystar
+                else UBXRTKBaseConfiguratorWithValset(self._survey_settings)
+            )
 
             if self.log:
                 if position is not None:
@@ -910,7 +938,14 @@ class RTKExtension(Extension):
             success = False
             try:
                 await connection.wait_until_connected()
-                await configurator.run(connection.write, sleep)
+                if need_survey:
+                    self._statistics.set_to_surveying_with_accuracy()
+                if is_allystar and preset.ntrip_assist and position is None:
+                    await self._run_ntrip_assisted_static_setup(
+                        preset, connection, configurator
+                    )
+                else:
+                    await configurator.run(connection.write, sleep)
                 success = True
             except Exception:
                 if self.log:
@@ -1021,12 +1056,160 @@ class RTKExtension(Extension):
 
                     # Currently we always target the first connection with
                     # the messages that attempt to start the survey.
-                    # This might change later. Also, survey is supported only
-                    # for U-blox receivers and autodetected connections at the moment.
+                    # This might change later. Survey setup is supported only
+                    # for known receiver types and autodetected connections.
                     if preset.format in ("auto", "ubx") and connections:
                         survey_task = await nursery.start(
                             self._run_survey, preset, connections[0]
                         )
+
+    async def _run_ntrip_assisted_static_setup(
+        self,
+        preset: RTKConfigurationPreset,
+        connection: RWConnection[bytes, bytes],
+        configurator: AllystarRTKBaseConfigurator,
+    ) -> None:
+        """Uses external NTRIP corrections to determine and freeze a base position."""
+
+        assert preset.ntrip_assist is not None
+
+        if self.log:
+            self.log.info(
+                f"Starting NTRIP-assisted static setup for {preset.title!r} "
+                f"using {preset.ntrip_assist!r}"
+            )
+
+        await configurator.run(connection.write, sleep)
+
+        get_location = (
+            self.app.import_api("location").get_location if self.app else None
+        )
+
+        async def generate_ntrip_gga_messages(
+            ntrip_connection: RWConnection[bytes, bytes],
+        ) -> None:
+            if not callable(get_location):
+                return
+
+            async for _ in periodic(5):
+                location = get_location()
+                if location is None or location.position is None:
+                    continue
+
+                alt: Optional[float] = location.position.amsl
+                if alt is None:
+                    alt = 0.0
+
+                message = format_gps_coordinate_as_nmea_gga_message(
+                    GPSCoordinate(
+                        location.position.lat, location.position.lon, amsl=alt
+                    )
+                )
+                await ntrip_connection.write(message.encode("ascii"))
+
+        async def relay_ntrip_corrections() -> None:
+            ntrip_connection = create_connection(preset.ntrip_assist)
+            async with ntrip_connection:
+                async with open_nursery() as relay_nursery:
+                    relay_nursery.start_soon(
+                        generate_ntrip_gga_messages, ntrip_connection
+                    )
+                    while True:
+                        data = await ntrip_connection.read(4096)
+                        if data:
+                            await connection.write(data)
+                        else:
+                            await sleep(0.1)
+
+        async with open_nursery() as nursery:
+            nursery.start_soon(relay_ntrip_corrections)
+            survey_result = await self._average_stable_antenna_position(preset)
+            nursery.cancel_scope.cancel()
+
+        if survey_result is None:
+            raise RuntimeError("NTRIP-assisted static setup did not converge")
+
+        fixed_settings = RTKSurveySettings(
+            position=survey_result.position,
+            duration=self._survey_settings.duration,
+            accuracy=survey_result.accuracy,
+            message_set=self._survey_settings.message_set,
+            gnss_types=self._survey_settings.gnss_types,
+        )
+        await AllystarRTKBaseConfigurator(
+            fixed_settings,
+            enable_moving_base_messages=preset.allystar_moving_base,
+        ).run(connection.write, sleep)
+        self._statistics.set_to_fixed_with_accuracy(fixed_settings.accuracy)
+
+        coord = ECEFToGPSCoordinateTransformation().to_gps(
+            survey_result.position
+        ).format()
+        status_message = (
+            f"NTRIP-assisted survey result for {preset.title!r}: {coord}; "
+            f"ECEF=({survey_result.position.x:.3f}, "
+            f"{survey_result.position.y:.3f}, {survey_result.position.z:.3f}) m; "
+            f"accuracy={survey_result.accuracy:.3f} m; "
+            f"samples={survey_result.sample_count}; "
+            f"duration={survey_result.duration:.1f} s"
+        )
+
+        if self.log:
+            self.log.info(status_message, extra={"semantics": "success"})
+
+        if self.app:
+            self.app.request_to_send_SYS_MSG_message(status_message)
+
+    async def _average_stable_antenna_position(
+        self, preset: RTKConfigurationPreset
+    ) -> Optional[NTRIPSurveyResult]:
+        deadline = monotonic() + max(preset.ntrip_assist_timeout, 1)
+        min_duration = max(preset.ntrip_assist_duration, 1)
+        max_drift = max(preset.ntrip_assist_stability, 0.001)
+        stable_since: Optional[float] = None
+        reference: Optional[ECEFCoordinate] = None
+        samples: list[ECEFCoordinate] = []
+
+        while monotonic() < deadline:
+            await sleep(1)
+            position = self._statistics.reference_position_ecef
+            if position is None:
+                stable_since = None
+                reference = None
+                samples.clear()
+                continue
+
+            if reference is None:
+                reference = position
+                stable_since = monotonic()
+                samples = [position]
+                continue
+
+            drift = distance_between_ecef_coordinates(reference, position)
+            if drift <= max_drift:
+                samples.append(position)
+                average = average_ecef_coordinates(samples)
+                accuracy = max(
+                    distance_between_ecef_coordinates(average, sample)
+                    for sample in samples
+                )
+                self._statistics.set_to_surveying_with_accuracy(max(accuracy, 0.001))
+                if (
+                    stable_since is not None
+                    and monotonic() - stable_since >= min_duration
+                ):
+                    return NTRIPSurveyResult(
+                        position=average,
+                        accuracy=max(accuracy, 0.001),
+                        duration=monotonic() - stable_since,
+                        sample_count=len(samples),
+                    )
+            else:
+                reference = position
+                stable_since = monotonic()
+                samples = [position]
+
+        return None
 
     async def _run_single_connection_for_preset(
         self, connection: RWConnection[bytes, bytes], *, preset: RTKConfigurationPreset
@@ -1036,7 +1219,11 @@ class RTKExtension(Extension):
         """
         assert self.app is not None
 
-        channel = ParserChannel(connection, parser=preset.create_gps_parser())  # type: ignore
+        parser = preset.create_gps_parser()
+        if preset.base_type == "allystar":
+            parser = AllystarParserDecorator(parser)
+
+        channel = ParserChannel(connection, parser=parser)  # type: ignore
         signal = self.app.import_api("signals").get(self.RTK_PACKET_SIGNAL)
         get_location = self.app.import_api("location").get_location
         rtcm_encoder = preset.create_rtcm_encoder()
@@ -1084,6 +1271,9 @@ class RTKExtension(Extension):
                 await connection.write(message.encode("ascii"))
 
         async with channel:
+            if preset.init:
+                await connection.write(preset.init)
+
             if maybe_vrs:
                 async with open_nursery() as nursery:
                     nursery.start_soon(generate_vrs_packets)
@@ -1264,6 +1454,69 @@ def get_schema():
                             "required": False,
                             "propertyOrder": 2000,
                         },
+                        "base_type": {
+                            "title": "Base station type",
+                            "type": "string",
+                            "enum": ["", "ublox", "allystar"],
+                            "default": "",
+                            "options": {
+                                "enum_titles": [
+                                    "Autodetect / generic",
+                                    "u-blox",
+                                    "Allystar HD9300/HD9400",
+                                ]
+                            },
+                            "required": False,
+                            "propertyOrder": 2100,
+                        },
+                        "ntrip_assist": {
+                            "title": "NTRIP assist source",
+                            "description": (
+                                "Optional NTRIP connection URL used to inject external "
+                                "RTCM corrections into an Allystar base while deriving "
+                                "a stable static position."
+                            ),
+                            "type": "string",
+                            "required": False,
+                            "propertyOrder": 2200,
+                        },
+                        "allystar_moving_base": {
+                            "title": "Enable Allystar moving-base RTCM",
+                            "description": (
+                                "Enable Allystar proprietary RTCM 4065/0 Reference "
+                                "Station PVT messages. Keep this disabled for a "
+                                "normal static RTK base."
+                            ),
+                            "type": "boolean",
+                            "default": False,
+                            "format": "checkbox",
+                            "required": False,
+                            "propertyOrder": 2205,
+                        },
+                        "ntrip_assist_duration": {
+                            "title": "NTRIP assist stable duration [s]",
+                            "type": "number",
+                            "minValue": 1,
+                            "default": 120,
+                            "required": False,
+                            "propertyOrder": 2210,
+                        },
+                        "ntrip_assist_timeout": {
+                            "title": "NTRIP assist timeout [s]",
+                            "type": "number",
+                            "minValue": 1,
+                            "default": 600,
+                            "required": False,
+                            "propertyOrder": 2220,
+                        },
+                        "ntrip_assist_stability": {
+                            "title": "NTRIP assist ECEF stability [m]",
+                            "type": "number",
+                            "minValue": 0.001,
+                            "default": 0.05,
+                            "required": False,
+                            "propertyOrder": 2230,
+                        },
                         "filter": {
                             "type": "object",
                             "title": "Message filter",
@@ -1430,7 +1683,7 @@ def get_schema():
                 "description": (
                     "Desired accuracy of RTK surveys for locally connected base "
                     "stations that need auto-configuration, in centimeters. "
-                    "Supported for base stations using uBlox chipsets."
+                    "Supported for base stations using u-blox or Allystar chipsets."
                 ),
                 "default": 100,
             },
@@ -1441,7 +1694,7 @@ def get_schema():
                 "description": (
                     "Minimum duration of RTK surveys for locally connected base "
                     "stations that need auto-configuration, in seconds. Supported "
-                    "for base stations using uBlox chipsets."
+                    "for base stations using u-blox or Allystar chipsets."
                 ),
                 "default": 60,
             },

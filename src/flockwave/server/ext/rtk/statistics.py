@@ -257,6 +257,55 @@ class SatelliteCNRs:
                     del self.entries[key]
 
 
+@dataclass
+class SatelliteCount:
+    """Satellite count observed from RTCM satellite lists or NMEA GGA."""
+
+    count: int = 0
+    _timestamp: float = 0.0
+
+    def clear(self) -> None:
+        self.count = 0
+        self._timestamp = 0.0
+
+    @property
+    def json(self) -> int:
+        self._flush_old_observation()
+        return self.count
+
+    def notify(self, packet: GPSPacket, timestamp: Optional[float] = None) -> None:
+        if timestamp is None:
+            timestamp = monotonic()
+
+        count = self._get_satellite_count(packet)
+        if count is not None:
+            self.count = count
+            self._timestamp = timestamp
+
+    def _flush_old_observation(self) -> None:
+        if self._timestamp and monotonic() - self._timestamp >= 15:
+            self.clear()
+
+    @staticmethod
+    def _get_satellite_count(packet: GPSPacket) -> Optional[int]:
+        satellites = getattr(packet, "satellites", None)
+        if satellites is not None:
+            try:
+                return len(satellites)
+            except TypeError:
+                pass
+
+        if getattr(packet, "sentence_type", None) == "GGA":
+            num_sats = getattr(packet, "num_sats", None)
+            if num_sats is not None:
+                try:
+                    return int(num_sats)
+                except (TypeError, ValueError):
+                    pass
+
+        return None
+
+
 class SurveyStatusFlag(IntFlag):
     """Status flags for a survey status object."""
 
@@ -277,9 +326,9 @@ class SurveyStatusFlag(IntFlag):
 class SurveyStatus:
     """Object that stores the status of the current survey procedure."""
 
-    #: Stores the estimated accuracy of the surveyed position, in meters; valid
-    #: only if the "valid" flag is set
-    accuracy: float = 0.0
+    #: Stores the estimated accuracy of the surveyed position, in meters, if
+    #: known.
+    accuracy: Optional[float] = None
 
     #: Status flags
     flags: SurveyStatusFlag = SurveyStatusFlag.UNKNOWN
@@ -303,7 +352,10 @@ class SurveyStatus:
     @property
     def json(self):
         """Returns the JSON representation of the survey status object."""
-        return {"accuracy": self.accuracy, "flags": self.flags}
+        result = {"flags": self.flags}
+        if self.accuracy is not None:
+            result["accuracy"] = self.accuracy
+        return result
 
     @property
     def supported(self) -> bool:
@@ -318,23 +370,35 @@ class SurveyStatus:
     def clear(self) -> None:
         """Clears the contents of the survey info object."""
         self.flags = SurveyStatusFlag.UNKNOWN
-        self.accuracy = 0.0
+        self.accuracy = None
 
     def notify(self, packet: UBXPacket) -> None:
         """Notifies the survey object about the arrival of a new packet."""
-        # We have a UBX NAV-SVIN packet so get the survey status from there
-        self.accuracy = int.from_bytes(packet.payload[28:32], "little") / 10000.0
-        self.flags = SurveyStatusFlag.SUPPORTED
-        if packet.payload[36]:
-            self.flags |= SurveyStatusFlag.VALID
-        if packet.payload[37]:
-            self.flags |= SurveyStatusFlag.ACTIVE
+        if self.is_survey_related_packet(packet):
+            # We have a UBX NAV-SVIN packet so get the survey status from there
+            self.accuracy = int.from_bytes(packet.payload[28:32], "little") / 10000.0
+            self.flags = SurveyStatusFlag.SUPPORTED
+            if packet.payload[36]:
+                self.flags |= SurveyStatusFlag.VALID
+            if packet.payload[37]:
+                self.flags |= SurveyStatusFlag.ACTIVE
+        else:
+            accuracy = getattr(packet, "accuracy", None)
+            if accuracy is not None and self.active:
+                self.accuracy = accuracy
 
     def set_to_fixed_with_accuracy(self, accuracy: float) -> None:
         """Notifies the survey object that the base station was switched to
         fixed-coordinate mode with the given accuracy.
         """
         self.flags = SurveyStatusFlag.SUPPORTED | SurveyStatusFlag.VALID
+        self.accuracy = accuracy
+
+    def set_to_surveying_with_accuracy(
+        self, accuracy: Optional[float] = None
+    ) -> None:
+        """Notifies the survey object that the base station is surveying."""
+        self.flags = SurveyStatusFlag.SUPPORTED | SurveyStatusFlag.ACTIVE
         self.accuracy = accuracy
 
 
@@ -349,7 +413,9 @@ class RTKStatistics:
         self._message_observations_rx = defaultdict(MessageObservations)
         self._message_observations_tx = defaultdict(MessageObservations)
         self._satellite_cnrs = SatelliteCNRs()
+        self._satellite_count = SatelliteCount()
         self._antenna_information = AntennaInformation()
+        self._receiver_position_ecef: Optional[ECEFCoordinate] = None
         self._survey_status = SurveyStatus()
         self.clear()
 
@@ -365,9 +431,12 @@ class RTKStatistics:
             max_age: maximum number of seconds that may pass without up-to-date
                 antenna position information
         """
+        satellite_count = max(
+            len(self._satellite_cnrs.entries), self._satellite_count.json
+        )
         return (
             self._antenna_information.age <= max_age
-            and len(self._satellite_cnrs.entries) >= min_satellite_count
+            and satellite_count >= min_satellite_count
         )
 
     def clear(self) -> None:
@@ -376,6 +445,8 @@ class RTKStatistics:
         self._message_observations_rx.clear()
         self._message_observations_tx.clear()
         self._satellite_cnrs.clear()
+        self._satellite_count.clear()
+        self._receiver_position_ecef = None
         self._survey_status.clear()
 
     @property
@@ -388,8 +459,19 @@ class RTKStatistics:
             "messages": self._message_observations_rx,
             "messages_tx": self._message_observations_tx,
             "cnr": self._satellite_cnrs,
+            "satelliteCount": self._satellite_count,
             "survey": self._survey_status,
         }
+
+    @property
+    def antenna_position_ecef(self) -> Optional[ECEFCoordinate]:
+        """Returns the currently known antenna position in ECEF coordinates."""
+        return self._antenna_information.position_ecef
+
+    @property
+    def reference_position_ecef(self) -> Optional[ECEFCoordinate]:
+        """Returns the best ECEF position to use for static base averaging."""
+        return self._antenna_information.position_ecef or self._receiver_position_ecef
 
     def notify(self, packet: GPSPacket, *, forwarded: bool = True) -> None:
         """Notifies the statistics object about the arrival of a new packet.
@@ -407,11 +489,18 @@ class RTKStatistics:
 
         if SatelliteCNRs.has_satellite_info(packet):
             self._satellite_cnrs.add(packet, monotonic())  # type: ignore
+        self._satellite_count.notify(packet, monotonic())
 
         if AntennaInformation.is_antenna_related_packet(packet):
             self._antenna_information.notify(packet)  # type: ignore
 
-        if SurveyStatus.is_survey_related_packet(packet):
+        receiver_position = getattr(packet, "position_ecef", None)
+        if receiver_position is not None:
+            self._receiver_position_ecef = receiver_position
+
+        if SurveyStatus.is_survey_related_packet(packet) or hasattr(
+            packet, "accuracy"
+        ):
             self._survey_status.notify(packet)  # type: ignore
 
     def set_to_fixed_with_accuracy(self, accuracy: float) -> None:
@@ -419,6 +508,12 @@ class RTKStatistics:
         known survey accuracy.
         """
         self._survey_status.set_to_fixed_with_accuracy(accuracy)
+
+    def set_to_surveying_with_accuracy(
+        self, accuracy: Optional[float] = None
+    ) -> None:
+        """Sets the base station statistics object to surveying mode."""
+        self._survey_status.set_to_surveying_with_accuracy(accuracy)
 
     @contextmanager
     def use(self):

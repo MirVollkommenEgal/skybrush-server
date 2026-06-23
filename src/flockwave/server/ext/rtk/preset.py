@@ -76,6 +76,26 @@ class RTKConfigurationPreset:
     RTCM messages. Can be used for source-specific initialization.
     """
 
+    base_type: Optional[str] = None
+    """Optional receiver type used when starting a survey."""
+
+    allystar_moving_base: bool = False
+    """Whether Allystar moving-base specific RTCM messages should be enabled."""
+
+    ntrip_assist: Optional[str] = None
+    """Optional NTRIP source whose RTCM stream is injected into the base while
+    determining a fixed position for the receiver.
+    """
+
+    ntrip_assist_duration: float = 120
+    """Minimum duration of the NTRIP-assisted position stabilization phase."""
+
+    ntrip_assist_timeout: float = 600
+    """Maximum time to wait for a stable NTRIP-assisted base position."""
+
+    ntrip_assist_stability: float = 0.05
+    """Maximum ECEF position drift in meters accepted as stable."""
+
     filter: Optional[GPSPacketFilter] = None
     """List of filters that the messages from the sources must pass through"""
 
@@ -163,6 +183,26 @@ class RTKConfigurationPreset:
         if "init" in updates:
             init = updates["init"]
             self.init = init if isinstance(init, bytes) else str(init).encode("utf-8")
+
+        if "base_type" in updates:
+            base_type = updates["base_type"]
+            self.base_type = None if base_type is None else str(base_type).lower()
+
+        if "allystar_moving_base" in updates:
+            self.allystar_moving_base = bool(updates["allystar_moving_base"])
+
+        if "ntrip_assist" in updates:
+            ntrip_assist = updates["ntrip_assist"]
+            self.ntrip_assist = None if ntrip_assist is None else str(ntrip_assist)
+
+        if "ntrip_assist_duration" in updates:
+            self.ntrip_assist_duration = float(updates["ntrip_assist_duration"])
+
+        if "ntrip_assist_timeout" in updates:
+            self.ntrip_assist_timeout = float(updates["ntrip_assist_timeout"])
+
+        if "ntrip_assist_stability" in updates:
+            self.ntrip_assist_stability = float(updates["ntrip_assist_stability"])
 
         if "filter" in updates:
             self.filter = create_filter_function(**updates["filter"])
@@ -282,6 +322,13 @@ class RTKConfigurationPreset:
             "type": self.type.value,
             "format": self.format,
             "sources": self.sources,
+            **({"base_type": self.base_type} if self.base_type else {}),
+            **(
+                {"allystar_moving_base": self.allystar_moving_base}
+                if self.allystar_moving_base
+                else {}
+            ),
+            **({"ntrip_assist": self.ntrip_assist} if self.ntrip_assist else {}),
         }
 
     def remove_all_sources(self) -> None:
