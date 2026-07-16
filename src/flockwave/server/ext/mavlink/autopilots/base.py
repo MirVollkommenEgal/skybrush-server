@@ -220,7 +220,13 @@ class Autopilot(ABC):
 
     @abstractmethod
     def handle_firmware_update(
-        self, uav: MAVLinkUAV, target_id: str, blob: bytes
+        self,
+        uav: MAVLinkUAV,
+        target_id: str,
+        blob: bytes,
+        *,
+        manifest=None,
+        minimum_battery_voltage: float = 7.0,
     ) -> AsyncIterator[Progress]:
         """Handles a firmware update request on the UAV.
 

@@ -291,7 +291,7 @@ class VirtualUAV(UAVBase):
             "firmware": f"v{self._version}-{self._version_hash[:4].hex()}",
         }
 
-    async def handle_firmware_update(self, target_id: str, blob: bytes):
+    async def handle_firmware_update(self, target_id: str, blob: bytes, **kwds):
         assert self.can_handle_firmware_update_target(target_id)
 
         new_hash = firmware_hash(blob).digest()

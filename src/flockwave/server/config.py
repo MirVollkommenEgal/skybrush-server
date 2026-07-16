@@ -41,7 +41,7 @@ EXTENSIONS = {
         "enabled": False,
     },
     "ext_manager": {},
-    "firmware_update": {},  # used to trigger auto-loading when the license is installed
+    "firmware_update": {"minimum_battery_voltage": 7.0},
     "frontend": {},
     "gps": {
         "connection": "gpsd",

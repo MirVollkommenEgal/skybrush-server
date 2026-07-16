@@ -1663,10 +1663,19 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             raise NotSupportedError
 
     async def handle_firmware_update(
-        self, target_id: str, blob: bytes
+        self,
+        target_id: str,
+        blob: bytes,
+        *,
+        manifest=None,
+        minimum_battery_voltage: float = 7.0,
     ) -> AsyncIterator[Progress]:
         async for event in self._autopilot.handle_firmware_update(
-            self, target_id, blob
+            self,
+            target_id,
+            blob,
+            manifest=manifest,
+            minimum_battery_voltage=minimum_battery_voltage,
         ):
             yield event
 

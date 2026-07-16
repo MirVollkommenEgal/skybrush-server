@@ -50,7 +50,9 @@ class UnknownAutopilot(Autopilot):
     async def get_geofence_status(self, uav: MAVLinkUAV) -> GeofenceStatus:
         raise NotSupportedError
 
-    def handle_firmware_update(self, uav: MAVLinkUAV, target_id: str, blob: bytes):
+    def handle_firmware_update(
+        self, uav: MAVLinkUAV, target_id: str, blob: bytes, **kwds
+    ):
         raise NotSupportedError
 
     @property
