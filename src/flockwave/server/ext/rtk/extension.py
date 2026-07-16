@@ -52,6 +52,8 @@ from flockwave.server.utils.serial import (
 
 from .beacon_manager import RTKBeaconManager
 from .allystar import (
+    AllystarAcknowledgementPacket,
+    AllystarAcknowledgementTracker,
     AllystarParserDecorator,
     AllystarRTKBaseConfigurator,
     average_ecef_coordinates,
@@ -237,6 +239,7 @@ class RTKExtension(Extension):
     RTK_PACKET_SIGNAL: ClassVar[str] = "rtk:packet"
 
     _clock_sync_validator: GPSClockSynchronizationValidator
+    _allystar_acknowledgements: AllystarAcknowledgementTracker
     _current_preset: Optional[RTKConfigurationPreset] = None
     _custom_user_presets_file: str = ""
     _dynamic_serial_port_configurations: list[SerialPortConfiguration]
@@ -262,6 +265,7 @@ class RTKExtension(Extension):
         self._presets = []
 
         self._clock_sync_validator = GPSClockSynchronizationValidator()
+        self._allystar_acknowledgements = AllystarAcknowledgementTracker()
         self._rtk_beacon_manager = RTKBeaconManager()
         self._statistics = RTKStatistics()
         self._survey_settings = RTKSurveySettings()
@@ -944,6 +948,12 @@ class RTKExtension(Extension):
                     await self._run_ntrip_assisted_static_setup(
                         preset, connection, configurator
                     )
+                elif is_allystar:
+                    await configurator.run(
+                        connection.write,
+                        sleep,
+                        acknowledgements=self._allystar_acknowledgements,
+                    )
                 else:
                     await configurator.run(connection.write, sleep)
                 success = True
@@ -1079,7 +1089,16 @@ class RTKExtension(Extension):
                 f"using {preset.ntrip_assist!r}"
             )
 
-        await configurator.run(connection.write, sleep)
+        # Keep the receiver in its normal positioning state while external RTCM
+        # corrections are injected. In particular, do not start Allystar's own
+        # CFG-SURVEY procedure and do not broadcast base corrections yet.
+        await configurator.run(
+            connection.write,
+            sleep,
+            acknowledgements=self._allystar_acknowledgements,
+            configure_position=False,
+            enable_rtcm_output=False,
+        )
 
         get_location = (
             self.app.import_api("location").get_location if self.app else None
@@ -1139,7 +1158,11 @@ class RTKExtension(Extension):
         await AllystarRTKBaseConfigurator(
             fixed_settings,
             enable_moving_base_messages=preset.allystar_moving_base,
-        ).run(connection.write, sleep)
+        ).run(
+            connection.write,
+            sleep,
+            acknowledgements=self._allystar_acknowledgements,
+        )
         self._statistics.set_to_fixed_with_accuracy(fixed_settings.accuracy)
 
         coord = ECEFToGPSCoordinateTransformation().to_gps(
@@ -1232,6 +1255,10 @@ class RTKExtension(Extension):
         async def handle_incoming_packets():
             """Handles incoming RTK correction packets from the connection."""
             async for packet in channel:
+                if isinstance(packet, AllystarAcknowledgementPacket):
+                    self._allystar_acknowledgements.notify(packet)
+                    continue
+
                 accepted = preset.accepts(packet) and self._message_set.accepts(packet)
 
                 self._clock_sync_validator.notify(packet)

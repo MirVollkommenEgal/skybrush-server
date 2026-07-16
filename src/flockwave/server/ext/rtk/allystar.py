@@ -8,9 +8,67 @@ from math import sqrt
 from struct import pack, unpack_from
 from typing import Any, Callable, Iterable
 
+from trio import Event, TooSlowError, fail_after
+
 from flockwave.gps.enums import GNSSType
 from flockwave.gps.rtk import RTKMessageSet, RTKSurveySettings
 from flockwave.gps.vectors import ECEFCoordinate
+
+
+class AllystarConfigurationError(RuntimeError):
+    """Raised when an Allystar configuration command is rejected or times out."""
+
+
+@dataclass
+class AllystarAcknowledgementPacket:
+    """ACK or NAK response for an Allystar binary command."""
+
+    acknowledged: bool
+    group_id: int
+    sub_id: int
+
+
+class AllystarAcknowledgementTracker:
+    """Waits for the acknowledgement of one Allystar command at a time."""
+
+    def __init__(self) -> None:
+        self._expected: tuple[int, int] | None = None
+        self._response: bool | None = None
+        self._event = Event()
+
+    def prepare(self, group_id: int, sub_id: int) -> None:
+        self._expected = (group_id, sub_id)
+        self._response = None
+        self._event = Event()
+
+    def notify(self, packet: AllystarAcknowledgementPacket) -> None:
+        if self._expected != (packet.group_id, packet.sub_id):
+            return
+
+        self._response = packet.acknowledged
+        self._event.set()
+
+    async def wait(self, timeout: float = 2) -> None:
+        expected = self._expected
+        if expected is None:
+            raise RuntimeError("no Allystar command is awaiting acknowledgement")
+
+        try:
+            with fail_after(timeout):
+                await self._event.wait()
+        except TooSlowError:
+            raise AllystarConfigurationError(
+                f"Allystar CFG command 0x{expected[0]:02X}/"
+                f"0x{expected[1]:02X} was not acknowledged within {timeout:g} seconds"
+            ) from None
+        finally:
+            self._expected = None
+
+        if not self._response:
+            raise AllystarConfigurationError(
+                f"Allystar CFG command 0x{expected[0]:02X}/"
+                f"0x{expected[1]:02X} was rejected with ACK-NAK"
+            )
 
 
 @dataclass
@@ -47,7 +105,10 @@ class AllystarBinaryParser:
         while True:
             start = self._buffer.find(b"\xF1\xD9")
             if start < 0:
-                self._buffer.clear()
+                if self._buffer.endswith(b"\xF1"):
+                    self._buffer[:] = b"\xF1"
+                else:
+                    self._buffer.clear()
                 break
             if start > 0:
                 del self._buffer[:start]
@@ -68,6 +129,15 @@ class AllystarBinaryParser:
                 result.append(self._parse_pverr_payload(packet[6:-2]))
             elif packet[2] == 0x01 and packet[3] == 0x01 and payload_length == 20:
                 result.append(self._parse_posecef_payload(packet[6:-2]))
+            elif packet[2] == 0x05 and packet[3] in (0x00, 0x01):
+                if payload_length == 2:
+                    result.append(
+                        AllystarAcknowledgementPacket(
+                            acknowledged=packet[3] == 0x01,
+                            group_id=packet[6],
+                            sub_id=packet[7],
+                        )
+                    )
 
         return result
 
@@ -160,16 +230,41 @@ class AllystarRTKBaseConfigurator:
         self,
         write: Callable[[bytes], Any],
         sleep: Callable[[float], Any],
+        *,
+        acknowledgements: AllystarAcknowledgementTracker | None = None,
+        configure_position: bool = True,
+        enable_rtcm_output: bool = True,
     ) -> None:
-        for packet in self._create_configuration_packets():
+        for packet in self._create_configuration_packets(
+            configure_position=configure_position,
+            enable_rtcm_output=enable_rtcm_output,
+        ):
+            if acknowledgements is not None:
+                acknowledgements.prepare(packet[2], packet[3])
             await write(packet)
-            await sleep(0.1)
+            if acknowledgements is not None:
+                await acknowledgements.wait()
+            else:
+                await sleep(0.1)
 
-    def _create_configuration_packets(self) -> list[bytes]:
+    def _create_configuration_packets(
+        self,
+        *,
+        configure_position: bool = True,
+        enable_rtcm_output: bool = True,
+    ) -> list[bytes]:
         settings = self.settings
         packets: list[bytes] = self._create_nmea_disable_packets()
         # Minimum 4 satellites, maximum 32 satellites.
         packets.append(self._create_packet(0x06, 0x11, pack("<BB", 4, 32)))
+        # Normal power mode with a 1 Hz position update rate.
+        packets.append(
+            self._create_packet(
+                0x06,
+                0x44,
+                pack("<BBHiII", 0, 0, 1, 1, 1000, 0),
+            )
+        )
         packets.append(
             self._create_packet(0x06, 0x01, pack("<BBB", 0x01, 0x01, 1))
         )  # NAV-POSECEF
@@ -177,16 +272,19 @@ class AllystarRTKBaseConfigurator:
             self._create_packet(0x06, 0x01, pack("<BBB", 0x01, 0x26, 1))
         )  # NAV-PVERR
 
-        if settings.position is not None:
-            packets.append(self._create_fixed_ecef_packet(settings.position))
-        else:
-            duration = max(int(round(settings.duration)), 1)
-            accuracy_mm = max(int(round(settings.accuracy * 1000)), 1)
-            packets.append(
-                self._create_packet(0x06, 0x12, pack("<II", duration, accuracy_mm))
-            )
+        if configure_position:
+            if settings.position is not None:
+                packets.append(self._create_fixed_ecef_packet(settings.position))
+            else:
+                duration = max(int(round(settings.duration)), 1)
+                accuracy_mm = max(int(round(settings.accuracy * 1000)), 1)
+                packets.append(
+                    self._create_packet(0x06, 0x12, pack("<II", duration, accuracy_mm))
+                )
 
-        packets.extend(self._create_rtcm_output_packets())
+        packets.extend(
+            self._create_rtcm_output_packets(enabled=enable_rtcm_output)
+        )
         return packets
 
     def _create_fixed_ecef_packet(self, position: ECEFCoordinate) -> bytes:
@@ -201,30 +299,36 @@ class AllystarRTKBaseConfigurator:
             ),
         )
 
-    def _create_rtcm_output_packets(self) -> list[bytes]:
+    def _create_rtcm_output_packets(self, *, enabled: bool = True) -> list[bytes]:
         settings = self.settings
         packets = [
-            self._create_message_rate_packet(0x05, 5),  # RTCM3 1005
+            self._create_message_rate_packet(0x05, 5 if enabled else 0),  # RTCM3 1005
         ]
-        if self.enable_moving_base_messages:
-            packets.append(
-                self._create_message_rate_packet(0x41, 1)  # Allystar 4065/0 PVT
-            )
+        packets.append(
+            self._create_message_rate_packet(
+                0x41, 1 if enabled and self.enable_moving_base_messages else 0
+            )  # Allystar 4065/0 PVT
+        )
 
         for gnss_type, message_id in self._EPHEMERIS_MESSAGES:
             packets.append(
                 self._create_message_rate_packet(
-                    message_id, 10 if settings.uses_gnss(gnss_type) else 0
+                    message_id,
+                    10 if enabled and settings.uses_gnss(gnss_type) else 0,
                 )
             )
-
-        if settings.message_set is not RTKMessageSet.MSM7:
-            return packets
 
         for gnss_type, message_id in self._MSM7_MESSAGES:
             packets.append(
                 self._create_message_rate_packet(
-                    message_id, 1 if settings.uses_gnss(gnss_type) else 0
+                    message_id,
+                    (
+                        1
+                        if enabled
+                        and settings.message_set is RTKMessageSet.MSM7
+                        and settings.uses_gnss(gnss_type)
+                        else 0
+                    ),
                 )
             )
 
