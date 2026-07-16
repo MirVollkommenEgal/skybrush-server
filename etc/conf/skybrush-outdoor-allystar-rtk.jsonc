@@ -1,0 +1,48 @@
+// Outdoor configuration for an Allystar HD9300/HD9400 RTK base connected
+// through a transparent serial-to-TCP bridge.
+//
+// Replace the IP address and port below with the TCP endpoint of the bridge.
+// The optional NTRIP-assisted static setup is intentionally disabled here; add
+// "ntrip_assist" only when you want the receiver to use external corrections
+// first and then freeze the derived base position as static.
+
+{
+  "EXTENSIONS": {
+    "http_server": {
+      "host": ""
+    },
+
+    "rtk": {
+      "add_serial_ports": false,
+      "survey_accuracy": 100,
+      "survey_duration": 120,
+      "use_high_precision": true,
+      "presets": {
+        "allystar-tcp": {
+          "title": "Allystar RTK base over TCP",
+          "source": "tcp://192.168.4.1:2001",
+          "format": "auto",
+          "base_type": "allystar",
+          "allystar_moving_base": false,
+          "auto_select": true,
+          "auto_survey": true,
+
+          // Optional intelligent setup. Leave ntrip_assist empty to disable it.
+          "ntrip_assist": "",
+          "ntrip_assist_duration": 120,
+          "ntrip_assist_timeout": 600,
+          "ntrip_assist_stability": 0.05
+        }
+      }
+    },
+
+    "mavlink": {
+      "enabled": true,
+      "networks": {
+        "mav": {
+          "connections": ["default"]
+        }
+      }
+    }
+  }
+}
