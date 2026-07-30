@@ -126,11 +126,9 @@ class FirmwareUpdateExtension(Extension):
         except (Base64Error, ValueError):
             raise RuntimeError("firmware image is not valid Base64") from None
 
-        manifest = message.body.get("manifest")
-        if not isinstance(manifest, dict):
-            raise RuntimeError("release manifest is missing")
-        blob = self._normalize_to_abin(source_blob, source_format, manifest)
-        self._validate_release(blob, manifest)
+        blob, manifest = self._prepare_release(
+            source_blob, source_format, message.body.get("manifest")
+        )
 
         return FirmwareUpdateRequest(
             blob=blob,
@@ -139,6 +137,31 @@ class FirmwareUpdateExtension(Extension):
             source_format=source_format,
             target_id=target_id,
         )
+
+    @classmethod
+    def _prepare_release(
+        cls, source: bytes, source_format: str, manifest: object
+    ) -> tuple[bytes, Mapping[str, Any]]:
+        if source_format == "apj" and manifest is None:
+            if not source:
+                raise RuntimeError("firmware image is empty")
+            body, git_identity = cls._decode_apj(source)
+            if (
+                not isinstance(git_identity, str)
+                or fullmatch(r"(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{40})", git_identity)
+                is None
+            ):
+                raise RuntimeError("APJ image has an invalid git_identity")
+
+            blob = cls._build_abin(body, git_identity)
+            manifest = cls._create_release_manifest(blob, git_identity)
+        else:
+            if not isinstance(manifest, dict):
+                raise RuntimeError("release manifest is missing")
+            blob = cls._normalize_to_abin(source, source_format, manifest)
+
+        cls._validate_release(blob, manifest)
+        return blob, manifest
 
     @classmethod
     def _normalize_to_abin(
@@ -151,39 +174,61 @@ class FirmwareUpdateExtension(Extension):
 
         body = source
         if source_format == "apj":
-            try:
-                apj = loads(source)
-            except (JSONDecodeError, UnicodeDecodeError):
-                raise RuntimeError("APJ image is not valid JSON") from None
-            if not isinstance(apj, dict) or apj.get("magic") != "APJFWv1":
-                raise RuntimeError("APJ image has an invalid magic value")
-            if apj.get("board_id") != 5602:
-                raise RuntimeError("APJ image is not for APJ board ID 5602")
-            encoded_image = apj.get("image")
-            if not isinstance(encoded_image, str):
-                raise RuntimeError("APJ image payload is missing")
-            try:
-                body = decompress(b64decode(encoded_image, validate=True))
-            except (Base64Error, ValueError, ZlibError):
-                raise RuntimeError("APJ firmware payload is invalid") from None
-            if apj.get("image_size") != len(body):
-                raise RuntimeError("APJ firmware size does not match its metadata")
-
-            git_identity = apj.get("git_identity")
+            body, git_identity = cls._decode_apj(source)
             manifest_git_sha = str(manifest.get("gitSha", ""))
             if isinstance(git_identity, str) and not compare_digest(
-                git_identity.lower(), manifest_git_sha.lower()
+                git_identity.lower(), manifest_git_sha[: len(git_identity)].lower()
             ):
                 raise RuntimeError("APJ Git identity does not match release manifest")
 
         git_sha = manifest.get("gitSha")
-        if not isinstance(git_sha, str) or fullmatch(r"[0-9a-fA-F]{40}", git_sha) is None:
+        return cls._build_abin(body, git_sha)
+
+    @staticmethod
+    def _decode_apj(source: bytes) -> tuple[bytes, object]:
+        try:
+            apj = loads(source)
+        except (JSONDecodeError, UnicodeDecodeError):
+            raise RuntimeError("APJ image is not valid JSON") from None
+        if not isinstance(apj, dict) or apj.get("magic") != "APJFWv1":
+            raise RuntimeError("APJ image has an invalid magic value")
+        if apj.get("board_id") != 5602:
+            raise RuntimeError("APJ image is not for APJ board ID 5602")
+        encoded_image = apj.get("image")
+        if not isinstance(encoded_image, str):
+            raise RuntimeError("APJ image payload is missing")
+        try:
+            body = decompress(b64decode(encoded_image, validate=True))
+        except (Base64Error, ValueError, ZlibError):
+            raise RuntimeError("APJ firmware payload is invalid") from None
+        if apj.get("image_size") != len(body):
+            raise RuntimeError("APJ firmware size does not match its metadata")
+        return body, apj.get("git_identity")
+
+    @staticmethod
+    def _build_abin(body: bytes, git_sha: object) -> bytes:
+        if (
+            not isinstance(git_sha, str)
+            or fullmatch(r"(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{40})", git_sha) is None
+        ):
             raise RuntimeError("release manifest has an invalid gitSha")
         body_md5 = md5(body, usedforsecurity=False).hexdigest()
         header = f"git version: {git_sha.lower()}\nMD5: {body_md5}\n--\n".encode(
             "ascii"
         )
         return header + body
+
+    @staticmethod
+    def _create_release_manifest(blob: bytes, git_sha: str) -> dict[str, Any]:
+        return {
+            "schemaVersion": 1,
+            "vehicleType": "ArduCopter",
+            "boardName": "DPH_FC_088",
+            "apjBoardId": 5602,
+            "gitSha": git_sha.lower(),
+            "abinSize": len(blob),
+            "abinSha256": sha256(blob).hexdigest(),
+        }
 
     @staticmethod
     def _validate_release(blob: bytes, manifest: object) -> None:
@@ -202,7 +247,10 @@ class FirmwareUpdateExtension(Extension):
 
         git_sha = manifest.get("gitSha")
         image_sha = manifest.get("abinSha256")
-        if not isinstance(git_sha, str) or fullmatch(r"[0-9a-fA-F]{40}", git_sha) is None:
+        if (
+            not isinstance(git_sha, str)
+            or fullmatch(r"(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{40})", git_sha) is None
+        ):
             raise RuntimeError("release manifest has an invalid gitSha")
         if not isinstance(image_sha, str) or fullmatch(r"[0-9a-fA-F]{64}", image_sha) is None:
             raise RuntimeError("release manifest has an invalid abinSha256")

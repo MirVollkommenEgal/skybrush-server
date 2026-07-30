@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from binascii import crc32
 from contextlib import aclosing
 from dataclasses import dataclass
 from functools import partial
@@ -28,6 +27,7 @@ from flockwave.server.model.safety import (
     LowBatteryThresholdType,
     SafetyConfigurationRequest,
 )
+from flockwave.server.show.utils import crc32_mavftp
 from flockwave.server.utils import clamp
 
 from ..enums import (
@@ -516,7 +516,7 @@ class ArduPilot(Autopilot):
                     raise RuntimeError("remote firmware size does not match local image")
 
                 remote_crc = await ftp.crc32(temp_path)
-                local_crc = crc32(blob) & 0xFFFFFFFF
+                local_crc = crc32_mavftp(blob, 0)
                 if remote_crc != local_crc:
                     raise RuntimeError(
                         f"remote firmware CRC mismatch: expected {local_crc:08X}, "
@@ -615,7 +615,9 @@ class ArduPilot(Autopilot):
             raise RuntimeError("invalid ArduPilot ABIN header") from None
 
         manifest_git_sha = str(manifest.get("gitSha", "")).lower()
-        if len(git_sha) != 40 or any(ch not in "0123456789abcdef" for ch in git_sha):
+        if len(git_sha) not in (8, 40) or any(
+            ch not in "0123456789abcdef" for ch in git_sha
+        ):
             raise RuntimeError("invalid Git SHA in ABIN header")
         if not compare_digest(git_sha, manifest_git_sha):
             raise RuntimeError("ABIN Git SHA does not match release manifest")
@@ -647,7 +649,7 @@ class ArduPilot(Autopilot):
             raise RuntimeError("firmware update is forbidden while the vehicle is armed")
 
         altitude = uav.status.position.ahl
-        if altitude is None or abs(altitude) > 0.3:
+        if not cls._is_vehicle_landed(heartbeat, altitude):
             raise RuntimeError("firmware update is forbidden unless the vehicle is landed")
 
         voltage = uav.status.battery.voltage
@@ -678,6 +680,16 @@ class ArduPilot(Autopilot):
         return uid
 
     @staticmethod
+    def _is_vehicle_landed(
+        heartbeat: MAVLinkMessage, altitude_above_home: float | None
+    ) -> bool:
+        return (
+            heartbeat.system_status == MAVState.STANDBY.value
+            or altitude_above_home is not None
+            and abs(altitude_above_home) <= 0.3
+        )
+
+    @staticmethod
     def _extract_uid2(version: MAVLinkMessage) -> bytes:
         uid = bytes(version.uid2)
         if not uid or not any(uid):
@@ -687,9 +699,12 @@ class ArduPilot(Autopilot):
     @staticmethod
     def _matches_firmware_hash(version: MAVLinkMessage, git_sha: str) -> bool:
         observed = bytes(version.flight_custom_version)
-        return observed in (
-            git_sha[:8].encode("ascii"),
-            bytes.fromhex(git_sha[:16]),
+        if observed == git_sha[:8].encode("ascii"):
+            return True
+
+        binary_prefix = bytes.fromhex(git_sha[:16])
+        return observed == binary_prefix or (
+            len(git_sha) == 8 and observed.startswith(binary_prefix)
         )
 
     @staticmethod

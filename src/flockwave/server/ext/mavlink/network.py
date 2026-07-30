@@ -473,7 +473,11 @@ class MAVLinkNetwork:
         await self.manager.broadcast_packet(spec, destination=channel)
 
     def enqueue_rc_override_packet(
-        self, channels: list[int], target_system: int = 0
+        self,
+        channels: list[int],
+        target_system: int = 0,
+        *,
+        destination: Any = None,
     ) -> None:
         """Handles a list of a RC channels that the server wishes to forward
         to the drones as RC override.
@@ -481,6 +485,9 @@ class MAVLinkNetwork:
         Parameters:
             channels: the values of the RC channels to send in a MAVLink
                 `RC_CHANNELS_OVERRIDE` message
+            target_system: MAVLink system ID to place in the message
+            destination: network address to send the message to. When omitted,
+                the message is broadcast.
         """
         if self.log:
             self.log.info(
@@ -513,9 +520,12 @@ class MAVLinkNetwork:
             chan17_raw=channels[16],
             chan18_raw=channels[17],
         )
-        self.manager.enqueue_broadcast_packet(
-            message, destination=Channel.RC, allow_failure=True
-        )
+        if destination is None:
+            self.manager.enqueue_broadcast_packet(
+                message, destination=Channel.RC, allow_failure=True
+            )
+        else:
+            self.manager.enqueue_packet(message, (Channel.RC, destination))
 
     def enqueue_rc_override_packet_for_uav(
         self, uav_id: str, channels: list[int]
@@ -531,7 +541,22 @@ class MAVLinkNetwork:
                         self.id,
                         system_id,
                     )
-                self.enqueue_rc_override_packet(channels, target_system=system_id)
+                address = self._uav_addresses.get(uav)
+                if address is None:
+                    if self.log:
+                        self.log.warning(
+                            "Could not route RC override to UAV %r on MAVLink "
+                            "network %s because its network address is unknown",
+                            uav_id,
+                            self.id,
+                        )
+                    return False
+
+                self.enqueue_rc_override_packet(
+                    channels,
+                    target_system=system_id,
+                    destination=address,
+                )
                 return True
         if self.log:
             self.log.warning(
