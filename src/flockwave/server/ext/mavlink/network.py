@@ -541,21 +541,9 @@ class MAVLinkNetwork:
                         self.id,
                         system_id,
                     )
-                address = self._uav_addresses.get(uav)
-                if address is None:
-                    if self.log:
-                        self.log.warning(
-                            "Could not route RC override to UAV %r on MAVLink "
-                            "network %s because its network address is unknown",
-                            uav_id,
-                            self.id,
-                        )
-                    return False
-
                 self.enqueue_rc_override_packet(
                     channels,
                     target_system=system_id,
-                    destination=address,
                 )
                 return True
         if self.log:
