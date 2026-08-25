@@ -55,6 +55,12 @@ from .registry import register_for_mavlink_type
 
 __all__ = ("ArduPilot", "ArduPilotWithSkybrush")
 
+_FIRMWARE_REBOOT_DISCONNECT_TIMEOUT = 30
+"""Seconds to wait until the telemetry link reflects the reboot."""
+
+_FIRMWARE_AUTOPILOT_VERSION_TIMEOUT = 30
+"""Seconds to wait for AUTOPILOT_VERSION after the UAV reconnects."""
+
 
 @register_for_mavlink_type(MAVAutopilot.ARDUPILOTMEGA)
 class ArduPilot(Autopilot):
@@ -726,7 +732,7 @@ class ArduPilot(Autopilot):
         start = monotonic()
         while uav.is_connected:
             await sleep(0.5)
-            if monotonic() - start > 8:
+            if monotonic() - start > _FIRMWARE_REBOOT_DISCONNECT_TIMEOUT:
                 raise RuntimeError("vehicle failed to disconnect after reboot request")
 
         start = monotonic()
@@ -751,7 +757,7 @@ class ArduPilot(Autopilot):
             version = uav.get_last_message(MAVMessageType.AUTOPILOT_VERSION)
             if version is not None:
                 return version
-            if monotonic() - start > 15:
+            if monotonic() - start > _FIRMWARE_AUTOPILOT_VERSION_TIMEOUT:
                 raise RuntimeError("AUTOPILOT_VERSION did not return after firmware update")
             await sleep(0.5)
 

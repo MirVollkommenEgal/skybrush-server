@@ -15,7 +15,10 @@ from struct import Struct
 from trio import (
     as_safe_channel,
     BrokenResourceError,
+    MemorySendChannel,
     move_on_after,
+    open_memory_channel,
+    open_nursery,
     TooSlowError,
     wrap_file,
 )
@@ -52,6 +55,15 @@ FTPPath = Union[str, bytes]
 
 _MAVFTP_CHUNK_SIZE = 239
 """Maximum number of bytes allowed in a single read/write operation."""
+
+_MAVFTP_WRITE_WINDOW_SIZE = 5
+"""Number of write operations that may be in flight at the same time.
+
+This matches the conservative default used by ArduPilot's MAVProxy and
+pymavlink MAVFTP clients. A window larger than one avoids paying a full link
+round-trip for every 239-byte chunk while keeping the autopilot's FTP request
+queue small.
+"""
 
 
 class MAVFTPOpCode(IntEnum):
@@ -653,7 +665,6 @@ class MAVFTP:
         Yields:
             progress updates about the state of the upload process
         """
-        fp = wrap_file(BytesIO(data))
         total_length = len(data)
 
         remote_path = self._resolve(remote_path)
@@ -666,25 +677,17 @@ class MAVFTP:
         message = MAVFTPMessage(MAVFTPOpCode.CREATE_FILE, data=remote_path)
         reply = await self._send_and_wait(message)
 
-        expected_crc = 0
-        offset = 0
+        expected_crc = crc32(data, 0)
 
         yield Progress(percentage=0)
         previous_progress = 0
 
-        async with self._open_session(reply.session_id) as session:
-            while True:
-                data = await fp.read(_MAVFTP_CHUNK_SIZE)
-                if data:
-                    offset += await session.write(data=data, offset=offset)
-                    expected_crc = crc32(data, expected_crc)
-                    progress = offset * 100 // total_length
-                    if progress > previous_progress:
-                        yield Progress(percentage=progress)
-                        previous_progress = progress
-
-                else:
-                    break
+        async with self._open_session(reply.session_id, pipelined=True) as session:
+            async for offset in self._write_chunks_with_window(session, data):
+                progress = offset * 100 // total_length
+                if progress > previous_progress:
+                    yield Progress(percentage=progress)
+                    previous_progress = progress
 
         if not skip_crc_check:
             observed_crc = await self.crc32(remote_path)
@@ -713,13 +716,81 @@ class MAVFTP:
         await self._send_and_wait(message)
 
     @asynccontextmanager
-    async def _open_session(self, session_id: int) -> AsyncIterator[MAVFTPSession]:
+    async def _open_session(
+        self, session_id: int, *, pipelined: bool = False
+    ) -> AsyncIterator[MAVFTPSession]:
         """Context manager that creates a new MAVFTP session for file uploads or
         downloads and closes the session when the context is exited.
         """
-        session = MAVFTPSession(session_id, self._send_and_wait)
+        sender = (
+            partial(self._send_and_wait, use_shared_retry_policy=False)
+            if pipelined
+            else self._send_and_wait
+        )
+        session = MAVFTPSession(session_id, sender)
         async with aclosing(session):
             yield session
+
+    @staticmethod
+    async def _write_chunks_with_window(
+        session: MAVFTPSession,
+        data: bytes,
+        *,
+        window_size: int = _MAVFTP_WRITE_WINDOW_SIZE,
+    ) -> AsyncGenerator[int, None]:
+        """Writes data with several MAVFTP requests in flight concurrently.
+
+        Yields the number of acknowledged bytes after every completed window.
+        Each request retains its own offset and retry state, so a lost packet
+        can be repeated without restarting the surrounding batch.
+        """
+        if window_size < 1:
+            raise ValueError("window_size must be positive")
+
+        acknowledged = 0
+        total_length = len(data)
+        window_byte_size = window_size * _MAVFTP_CHUNK_SIZE
+
+        while acknowledged < total_length:
+            window_end = min(acknowledged + window_byte_size, total_length)
+            result_tx, result_rx = open_memory_channel[Optional[Exception]](
+                window_size
+            )
+
+            async def write_and_report(
+                chunk: bytes,
+                offset: int,
+                sender: MemorySendChannel[Optional[Exception]],
+            ) -> None:
+                try:
+                    await session.write(chunk, offset)
+                except Exception as ex:
+                    await sender.send(ex)
+                else:
+                    await sender.send(None)
+
+            error: Optional[Exception] = None
+            async with open_nursery() as nursery:
+                offset = acknowledged
+                request_count = 0
+                while offset < window_end:
+                    chunk = data[offset : min(offset + _MAVFTP_CHUNK_SIZE, window_end)]
+                    nursery.start_soon(write_and_report, chunk, offset, result_tx)
+                    offset += len(chunk)
+                    request_count += 1
+
+                for _ in range(request_count):
+                    result = await result_rx.receive()
+                    if result is not None:
+                        error = result
+                        nursery.cancel_scope.cancel()
+                        break
+
+            if error is not None:
+                raise error
+
+            acknowledged = window_end
+            yield acknowledged
 
     def _parents_of(self, path: FTPPath) -> Iterable[FTPPath]:
         if isinstance(path, str):
@@ -750,6 +821,7 @@ class MAVFTP:
         message: MAVFTPMessage,
         *,
         allow_nak: bool = False,
+        use_shared_retry_policy: bool = True,
     ) -> MAVFTPMessage:
         """Sends a raw FTP message over the connection and waits for the response
         from the PixHawk.
@@ -757,6 +829,8 @@ class MAVFTP:
         Parameters:
             message: the MAVFTP message to send
             allow_nak: whether we consider a NAK message a valid response
+            use_shared_retry_policy: whether to use the connection-level adaptive
+                retry policy. Concurrent requests must use separate policies.
 
         Returns:
             the FTP message sent by the UAV in response
@@ -779,9 +853,19 @@ class MAVFTP:
             assert reply is not None
             return reply
 
+        retry_policy = (
+            self._retry_policy
+            if use_shared_retry_policy
+            else AdaptiveExponentialBackoffPolicy(
+                max_retries=600,
+                base_timeout=getattr(self._retry_policy, "base_timeout", 0.1),
+                max_timeout=3,
+            )
+        )
+
         while True:
             try:
-                reply = await run_with_retries(do_send, policy=self._retry_policy)
+                reply = await run_with_retries(do_send, policy=retry_policy)
             except TimeoutError:
                 raise TooSlowError(
                     "No response received for MAVFTP packet in time"

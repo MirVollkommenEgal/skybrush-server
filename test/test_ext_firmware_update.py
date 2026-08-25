@@ -7,6 +7,7 @@ from zlib import compress
 import pytest
 
 from flockwave.server.ext.firmware_update.extension import FirmwareUpdateExtension
+from flockwave.server.ext.mavlink.autopilots import ardupilot
 from flockwave.server.ext.mavlink.autopilots.ardupilot import ArduPilot
 from flockwave.server.ext.mavlink.enums import MAVState
 
@@ -167,3 +168,30 @@ def test_two_cell_li_ion_voltage_threshold_defaults_to_seven_volts() -> None:
     extension.configure({})
 
     assert extension._minimum_battery_voltage == 7.0
+
+
+async def test_firmware_reboot_allows_delayed_disconnect_and_reconnect(
+    monkeypatch,
+) -> None:
+    now = 0.0
+
+    class UAV:
+        @property
+        def is_connected(self) -> bool:
+            return now < 10 or now >= 20
+
+    async def advance_time(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(ardupilot, "monotonic", lambda: now)
+    monkeypatch.setattr(ardupilot, "sleep", advance_time)
+
+    updates = [
+        progress
+        async for progress in ArduPilot._observe_firmware_reboot(UAV())
+    ]
+
+    assert now == 20
+    assert updates
+    assert updates[-1].message == "Waiting for firmware to boot"
