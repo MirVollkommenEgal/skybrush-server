@@ -136,10 +136,10 @@ class RTKGuardExtension(Extension):
                 finally:
                     if self._passive_connections.get(role) is connection:
                         self._passive_connections.pop(role, None)
-            except Exception:
+            except Exception as exc:
                 if self.log and role not in self._suspended_passive_roles:
-                    self.log.exception(
-                        f"RTK guard lost its passive {role} monitoring connection"
+                    self.log.warning(
+                        f"RTK guard lost its passive {role} monitoring connection: {exc}"
                     )
                 await sleep(1)
 

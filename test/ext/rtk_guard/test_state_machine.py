@@ -155,3 +155,27 @@ def test_unknown_ntrip_position_is_learned_and_cumulative_drift_is_detected():
     health = evaluate_source(state, 1, config)
     assert "POSITION_MISMATCH" in health.reasons
     assert "POSITION_JUMP" not in health.reasons
+
+
+def test_staggered_msm_packet_arrivals_remain_consistent():
+    engine = RTKGuardEngine(make_config())
+    engine.feed_primary(msm(epoch=100), 0.0)
+    engine.feed_backup(msm(epoch=100), 0.0)
+    status0 = engine.tick(0.0, "primary")
+    assert status0.pair.state is PairState.CONSISTENT
+
+    # Primary receives next 1Hz epoch at t=1.0, but backup has not yet received it at t=1.05
+    engine.feed_primary(msm(epoch=101), 1.0)
+    status1 = engine.tick(1.05, "primary")
+    assert status1.pair.state is PairState.CONSISTENT
+
+    # Backup receives epoch 101 slightly later at t=1.2
+    engine.feed_backup(msm(epoch=101), 1.2)
+    status2 = engine.tick(1.25, "primary")
+    assert status2.pair.state is PairState.CONSISTENT
+
+    # Primary receives epoch 102 at t=2.0
+    engine.feed_primary(msm(epoch=102), 2.0)
+    status3 = engine.tick(2.05, "primary")
+    assert status3.pair.state is PairState.CONSISTENT
+

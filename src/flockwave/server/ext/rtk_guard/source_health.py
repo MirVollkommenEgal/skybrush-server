@@ -38,6 +38,10 @@ def update_base(state: BaseState, packet: DecodedRTCM, now: float) -> None:
                 del state.satellites[key]
 
         cnrs: list[float] = []
+        epoch_obs = state.epoch_observations.setdefault(packet.constellation, {})
+        epoch_mono = state.epoch_monotonics.setdefault(packet.constellation, {})
+        current_epoch_obs: dict[SatKey, SatelliteObservation] = {}
+
         for key, observation in packet.observations.items():
             previous = state.previous_locks.get(key)
             previous_half_cycle = state.previous_half_cycles.get(key)
@@ -49,8 +53,18 @@ def update_base(state: BaseState, packet: DecodedRTCM, now: float) -> None:
             state.previous_locks[key] = observation.lock_time
             state.previous_half_cycles[key] = observation.half_cycle
             state.satellites[key] = observation
+            current_epoch_obs[key] = observation
             if observation.cnr is not None:
                 cnrs.append(observation.cnr)
+
+        epoch_obs[packet.epoch] = current_epoch_obs
+        epoch_mono[packet.epoch] = now
+
+        if len(epoch_obs) > 10:
+            for old_epoch in sorted(epoch_obs.keys())[:-10]:
+                epoch_obs.pop(old_epoch, None)
+                epoch_mono.pop(old_epoch, None)
+
         if cnrs:
             history = state.cnr_history.setdefault(packet.constellation, [])
             history.append(median(cnrs))

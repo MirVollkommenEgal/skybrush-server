@@ -101,6 +101,10 @@ class BaseState:
     last_msm_by_constellation: dict[str, float] = field(default_factory=dict)
     msm_epochs: dict[str, float] = field(default_factory=dict)
     satellites: dict[SatKey, SatelliteObservation] = field(default_factory=dict)
+    epoch_observations: dict[str, dict[float, dict[SatKey, SatelliteObservation]]] = field(
+        default_factory=dict
+    )
+    epoch_monotonics: dict[str, dict[float, float]] = field(default_factory=dict)
     previous_locks: dict[SatKey, int] = field(default_factory=dict)
     previous_half_cycles: dict[SatKey, bool] = field(default_factory=dict)
     cycle_slips_at: list[float] = field(default_factory=list)
