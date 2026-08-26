@@ -440,7 +440,9 @@ class RTKExtension(Extension):
         return {
             "are_corrections_ok": self._are_corrections_ok,
             "get_current_preset": self._get_current_preset,
+            "get_preset": self._get_preset,
             "get_statistics": self._get_statistics,
+            "request_source_switch": self.request_source_switch,
         }
 
     def find_preset_by_id(
@@ -737,6 +739,17 @@ class RTKExtension(Extension):
         This function is exported to other extensions via the exports object.
         """
         return self._current_preset
+
+    def _get_preset(self, preset_id: str) -> Optional[RTKConfigurationPreset]:
+        """Returns an RTK preset by ID for cooperating extensions."""
+        return self.find_preset_by_id(preset_id)
+
+    async def request_source_switch(self, preset_id: str) -> None:
+        """Requests a source switch through the public RTK extension API."""
+        preset = self.find_preset_by_id(preset_id)
+        if preset is None:
+            raise ValueError(f"No RTK preset named {preset_id!r}")
+        await self._request_preset_switch(preset)
 
     def _get_statistics(self) -> RTKStatistics:
         """Returns the statistics of the RTK messages being received.
