@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from functools import partial
 from pathlib import Path
-from struct import pack
 from time import monotonic
 from trio import CancelScope, open_memory_channel, open_nursery, sleep
 from trio.abc import SendChannel
@@ -24,7 +23,7 @@ from flockwave.connections import create_connection, RWConnection
 from flockwave.gps.enums import GNSSType
 from flockwave.gps.formatting import format_gps_coordinate_as_nmea_gga_message
 from flockwave.gps.rtk import RTKMessageSet, RTKSurveySettings
-from flockwave.gps.ubx.rtk_config import UBXRTKBaseConfigurator
+from flockwave.gps.ubx.packet import UBXPacket
 from flockwave.gps.vectors import (
     ECEFCoordinate,
     ECEFToGPSCoordinateTransformation,
@@ -68,138 +67,7 @@ from .preset import (
 )
 from .registry import RTKPresetRegistry
 from .statistics import RTKStatistics
-
-
-class UBXRTKBaseConfiguratorWithValset(UBXRTKBaseConfigurator):
-    """U-blox RTK base configurator with Generation 9/10 VALSET support.
-
-    Newer u-blox receivers, including X20-class devices, may reject legacy
-    CFG-MSG and CFG-TMODE3 commands. The base class still handles older M8/F9
-    receivers, then this class sends the equivalent configuration database
-    updates for receivers that require UBX-CFG-VALSET.
-    """
-
-    async def run(
-        self,
-        write: Callable[[bytes], Any],
-        sleep: Callable[[float], Any],
-    ):
-        await super().run(write, sleep)
-        await sleep(0.2)
-        await write(self._create_valset_message(self._create_valset_items()))
-
-    def _create_valset_items(self) -> list[tuple[int, str, int]]:
-        settings = self.settings
-        use_high_precision = settings.message_set is RTKMessageSet.MSM7
-
-        items: list[tuple[int, str, int]] = [
-            (0x10770001, "L001", 1),  # CFG-USBINPROT-UBX
-            (0x10780001, "L001", 1),  # CFG-USBOUTPROT-UBX
-            (0x10780004, "L001", 1),  # CFG-USBOUTPROT-RTCM3X
-            (0x30210001, "U002", 1000),  # CFG-RATE-MEAS, 1 Hz
-            (0x20110021, "E001", 2),  # CFG-NAVSPG-DYNMODEL, stationary
-            (0x2091005E, "U001", 5),  # CFG-MSGOUT-UBX_NAV_TIMEUTC_USB
-            (0x2091008B, "U001", 1),  # CFG-MSGOUT-UBX_NAV_SVIN_USB
-            (0x209102C0, "U001", 5),  # CFG-MSGOUT-RTCM_3X_TYPE1005_USB
-        ]
-
-        for gnss_type, msm4_key, msm7_key in (
-            (GNSSType.GPS, 0x20910361, 0x209102CF),
-            (GNSSType.GLONASS, 0x20910366, 0x209102D4),
-            (GNSSType.GALILEO, 0x2091036B, 0x2091031B),
-            (GNSSType.BEIDOU, 0x20910370, 0x209102D9),
-        ):
-            enabled = settings.uses_gnss(gnss_type)
-            items.append(
-                (msm4_key, "U001", 0 if use_high_precision or not enabled else 1)
-            )
-            items.append(
-                (msm7_key, "U001", 1 if use_high_precision and enabled else 0)
-            )
-
-        items.append(
-            (
-                0x20910306,  # CFG-MSGOUT-RTCM_3X_TYPE1230_USB
-                "U001",
-                5 if settings.uses_gnss(GNSSType.GLONASS) else 0,
-            )
-        )
-
-        position = settings.position
-        if position is not None:
-            position_in_one_tenth_of_mm = position * 10000
-            coords_in_one_tenth_of_mm = (
-                int(round(position_in_one_tenth_of_mm.x)),
-                int(round(position_in_one_tenth_of_mm.y)),
-                int(round(position_in_one_tenth_of_mm.z)),
-            )
-            coords, coords_hp = zip(
-                *(divmod(coord, 100) for coord in coords_in_one_tenth_of_mm)
-            )
-            items.extend(
-                [
-                    (0x20030002, "E001", 0),  # CFG-TMODE-POS_TYPE, ECEF
-                    (0x40030003, "I004", coords[0]),  # CFG-TMODE-ECEF_X
-                    (0x40030004, "I004", coords[1]),  # CFG-TMODE-ECEF_Y
-                    (0x40030005, "I004", coords[2]),  # CFG-TMODE-ECEF_Z
-                    (0x20030006, "I001", coords_hp[0]),  # CFG-TMODE-ECEF_X_HP
-                    (0x20030007, "I001", coords_hp[1]),  # CFG-TMODE-ECEF_Y_HP
-                    (0x20030008, "I001", coords_hp[2]),  # CFG-TMODE-ECEF_Z_HP
-                    (
-                        0x4003000F,  # CFG-TMODE-FIXED_POS_ACC
-                        "U004",
-                        max(int(round(settings.accuracy * 10000)), 1),
-                    ),
-                    (0x20030001, "E001", 2),  # CFG-TMODE-MODE, fixed
-                ]
-            )
-        else:
-            items.extend(
-                [
-                    (
-                        0x40030010,  # CFG-TMODE-SVIN_MIN_DUR
-                        "U004",
-                        max(int(round(settings.duration)), 1),
-                    ),
-                    (
-                        0x40030011,  # CFG-TMODE-SVIN_ACC_LIMIT
-                        "U004",
-                        max(int(round(settings.accuracy * 10000)), 1),
-                    ),
-                    (0x20030001, "E001", 1),  # CFG-TMODE-MODE, survey-in
-                ]
-            )
-
-        return items
-
-    @staticmethod
-    def _create_valset_message(items: Sequence[tuple[int, str, int]]) -> bytes:
-        payload = bytearray([0, 1, 0, 0])  # version 0, RAM layer only
-
-        for key, type_, value in items:
-            payload.extend(pack("<I", key))
-            if type_ in ("E001", "L001", "U001"):
-                payload.extend(pack("<B", value))
-            elif type_ == "I001":
-                payload.extend(pack("<b", value))
-            elif type_ == "U002":
-                payload.extend(pack("<H", value))
-            elif type_ == "I004":
-                payload.extend(pack("<i", value))
-            elif type_ == "U004":
-                payload.extend(pack("<I", value))
-            else:
-                raise ValueError(f"Unsupported UBX configuration type: {type_!r}")
-
-        header = bytearray([0xB5, 0x62, 0x06, 0x8A])
-        header.extend(pack("<H", len(payload)))
-        packet = header + payload
-        ck_a = ck_b = 0
-        for byte in packet[2:]:
-            ck_a = (ck_a + byte) & 0xFF
-            ck_b = (ck_b + ck_a) & 0xFF
-        packet.extend([ck_a, ck_b])
-        return bytes(packet)
+from .ublox import UBXAcknowledgementTracker, UBXRTKBaseConfiguratorWithValset
 
 
 @dataclass
@@ -255,6 +123,7 @@ class RTKExtension(Extension):
     _statistics: RTKStatistics
     _survey_settings: RTKSurveySettings
     _tx_queue: Optional[SendChannel] = None
+    _rtcm_forwarding_enabled: bool = True
 
     def __init__(self):
         """Constructor."""
@@ -266,6 +135,8 @@ class RTKExtension(Extension):
 
         self._clock_sync_validator = GPSClockSynchronizationValidator()
         self._allystar_acknowledgements = AllystarAcknowledgementTracker()
+        self._ubx_acknowledgements = UBXAcknowledgementTracker()
+        self._serial_ntrip_assist: dict[str, Any] = {}
         self._rtk_beacon_manager = RTKBeaconManager()
         self._statistics = RTKStatistics()
         self._survey_settings = RTKSurveySettings()
@@ -286,6 +157,7 @@ class RTKExtension(Extension):
             )
 
         self._dynamic_serial_port_configurations = []
+        self._serial_ntrip_assist = dict(configuration.get("serial_ntrip_assist") or {})
         serial_port_specs = configuration.get("add_serial_ports")
         if serial_port_specs is not None:
             serial_port_spec_list: list[Union[int, dict]]
@@ -728,6 +600,7 @@ class RTKExtension(Extension):
         """
         return (
             self._get_current_preset() is not None
+            and self._rtcm_forwarding_enabled
             and self._get_statistics().are_corrections_ok(
                 min_satellite_count=min_satellite_count, max_age=max_age
             )
@@ -954,13 +827,16 @@ class RTKExtension(Extension):
 
             success = False
             try:
+                if preset.ntrip_assist and need_survey:
+                    self._rtcm_forwarding_enabled = False
                 await connection.wait_until_connected()
                 if need_survey:
                     self._statistics.set_to_surveying_with_accuracy()
-                if is_allystar and preset.ntrip_assist and position is None:
-                    await self._run_ntrip_assisted_static_setup(
-                        preset, connection, configurator
-                    )
+                if preset.ntrip_assist and position is None:
+                    with self._statistics.guided_survey():
+                        await self._run_ntrip_assisted_static_setup(
+                            preset, connection, configurator
+                        )
                 elif is_allystar:
                     await configurator.run(
                         connection.write,
@@ -969,6 +845,7 @@ class RTKExtension(Extension):
                     )
                 else:
                     await configurator.run(connection.write, sleep)
+                self._rtcm_forwarding_enabled = True
                 success = True
             except Exception:
                 if self.log:
@@ -1013,6 +890,9 @@ class RTKExtension(Extension):
         assert self.app is not None
 
         self._clock_sync_validator.assume_sync()
+        self._rtcm_forwarding_enabled = not (
+            preset.ntrip_assist and self._survey_settings.position is None
+        )
 
         with ExitStack() as stack:
             assert self._rtk_survey_trigger is not None
@@ -1090,28 +970,33 @@ class RTKExtension(Extension):
         self,
         preset: RTKConfigurationPreset,
         connection: RWConnection[bytes, bytes],
-        configurator: AllystarRTKBaseConfigurator,
+        configurator: Union[
+            AllystarRTKBaseConfigurator, UBXRTKBaseConfiguratorWithValset
+        ],
     ) -> None:
         """Uses external NTRIP corrections to determine and freeze a base position."""
 
         assert preset.ntrip_assist is not None
 
         if self.log:
-            self.log.info(
-                f"Starting NTRIP-assisted static setup for {preset.title!r} "
-                f"using {preset.ntrip_assist!r}"
-            )
+            self.log.info(f"Starting NTRIP-assisted static setup for {preset.title!r}")
 
         # Keep the receiver in its normal positioning state while external RTCM
         # corrections are injected. In particular, do not start Allystar's own
         # CFG-SURVEY procedure and do not broadcast base corrections yet.
-        await configurator.run(
-            connection.write,
-            sleep,
-            acknowledgements=self._allystar_acknowledgements,
-            configure_position=False,
-            enable_rtcm_output=False,
-        )
+        if isinstance(configurator, UBXRTKBaseConfiguratorWithValset):
+            await configurator.configure_rover(
+                connection.write, self._ubx_acknowledgements
+            )
+        else:
+            await configurator.run(
+                connection.write,
+                sleep,
+                acknowledgements=self._allystar_acknowledgements,
+                configure_position=False,
+                enable_rtcm_output=False,
+            )
+        self._statistics.clear_receiver_position()
 
         get_location = (
             self.app.import_api("location").get_location if self.app else None
@@ -1139,7 +1024,10 @@ class RTKExtension(Extension):
                 )
                 await ntrip_connection.write(message.encode("ascii"))
 
+        last_correction_at: Optional[float] = None
+
         async def relay_ntrip_corrections() -> None:
+            nonlocal last_correction_at
             ntrip_connection = create_connection(preset.ntrip_assist)
             async with ntrip_connection:
                 async with open_nursery() as relay_nursery:
@@ -1150,12 +1038,19 @@ class RTKExtension(Extension):
                         data = await ntrip_connection.read(4096)
                         if data:
                             await connection.write(data)
+                            last_correction_at = monotonic()
                         else:
-                            await sleep(0.1)
+                            raise RuntimeError(
+                                "NTRIP correction stream closed during survey"
+                            )
 
         async with open_nursery() as nursery:
             nursery.start_soon(relay_ntrip_corrections)
-            survey_result = await self._average_stable_antenna_position(preset)
+            survey_result = await self._average_stable_antenna_position(
+                preset,
+                corrections_fresh=lambda: last_correction_at is not None
+                and monotonic() - last_correction_at <= 5,
+            )
             nursery.cancel_scope.cancel()
 
         if survey_result is None:
@@ -1168,19 +1063,24 @@ class RTKExtension(Extension):
             message_set=self._survey_settings.message_set,
             gnss_types=self._survey_settings.gnss_types,
         )
-        await AllystarRTKBaseConfigurator(
-            fixed_settings,
-            enable_moving_base_messages=preset.allystar_moving_base,
-        ).run(
-            connection.write,
-            sleep,
-            acknowledgements=self._allystar_acknowledgements,
-        )
+        if isinstance(configurator, UBXRTKBaseConfiguratorWithValset):
+            await UBXRTKBaseConfiguratorWithValset(fixed_settings).configure_fixed(
+                connection.write, self._ubx_acknowledgements
+            )
+        else:
+            await AllystarRTKBaseConfigurator(
+                fixed_settings,
+                enable_moving_base_messages=preset.allystar_moving_base,
+            ).run(
+                connection.write,
+                sleep,
+                acknowledgements=self._allystar_acknowledgements,
+            )
         self._statistics.set_to_fixed_with_accuracy(fixed_settings.accuracy)
 
-        coord = ECEFToGPSCoordinateTransformation().to_gps(
-            survey_result.position
-        ).format()
+        coord = (
+            ECEFToGPSCoordinateTransformation().to_gps(survey_result.position).format()
+        )
         status_message = (
             f"NTRIP-assisted survey result for {preset.title!r}: {coord}; "
             f"ECEF=({survey_result.position.x:.3f}, "
@@ -1197,7 +1097,10 @@ class RTKExtension(Extension):
             self.app.request_to_send_SYS_MSG_message(status_message)
 
     async def _average_stable_antenna_position(
-        self, preset: RTKConfigurationPreset
+        self,
+        preset: RTKConfigurationPreset,
+        *,
+        corrections_fresh: Optional[Callable[[], bool]] = None,
     ) -> Optional[NTRIPSurveyResult]:
         deadline = monotonic() + max(preset.ntrip_assist_timeout, 1)
         min_duration = max(preset.ntrip_assist_duration, 1)
@@ -1205,45 +1108,63 @@ class RTKExtension(Extension):
         stable_since: Optional[float] = None
         reference: Optional[ECEFCoordinate] = None
         samples: list[ECEFCoordinate] = []
+        accuracies: list[float] = []
+        last_sample_at: Optional[float] = None
+        require_fixed = preset.base_type != "allystar"
 
         while monotonic() < deadline:
             await sleep(1)
-            position = self._statistics.reference_position_ecef
-            if position is None:
+            now = monotonic()
+            solution = self._statistics.receiver_position
+            if (
+                solution is None
+                or now - solution.timestamp > 2.5
+                or (require_fixed and not solution.rtk_fixed)
+                or (corrections_fresh is not None and not corrections_fresh())
+            ):
                 stable_since = None
                 reference = None
                 samples.clear()
+                accuracies.clear()
+                last_sample_at = None
+                self._statistics.set_to_surveying_with_accuracy()
                 continue
+            if solution.timestamp == last_sample_at:
+                continue  # Never count a cached solution as a new measurement.
+            last_sample_at = solution.timestamp
+            position = solution.position
 
-            if reference is None:
+            if (
+                reference is None
+                or distance_between_ecef_coordinates(reference, position) > max_drift
+            ):
                 reference = position
-                stable_since = monotonic()
-                samples = [position]
-                continue
+                stable_since = now
+                samples.clear()
+                accuracies.clear()
 
-            drift = distance_between_ecef_coordinates(reference, position)
-            if drift <= max_drift:
-                samples.append(position)
-                average = average_ecef_coordinates(samples)
-                accuracy = max(
-                    distance_between_ecef_coordinates(average, sample)
-                    for sample in samples
+            samples.append(position)
+            accuracies.append(solution.accuracy)
+            average = average_ecef_coordinates(samples)
+            spread = max(
+                distance_between_ecef_coordinates(average, sample) for sample in samples
+            )
+            # GNSS epochs are correlated: do not divide pAcc by sqrt(N).
+            # Show the mean receiver accuracy, bounded by the observed spread.
+            accuracy = max(sum(accuracies) / len(accuracies), spread, 0.001)
+            self._statistics.set_to_surveying_with_accuracy(accuracy)
+            if (
+                stable_since is not None
+                and now - stable_since >= min_duration
+                and len(samples) >= 2
+                and accuracy <= self._survey_settings.accuracy
+            ):
+                return NTRIPSurveyResult(
+                    position=average,
+                    accuracy=accuracy,
+                    duration=now - stable_since,
+                    sample_count=len(samples),
                 )
-                self._statistics.set_to_surveying_with_accuracy(max(accuracy, 0.001))
-                if (
-                    stable_since is not None
-                    and monotonic() - stable_since >= min_duration
-                ):
-                    return NTRIPSurveyResult(
-                        position=average,
-                        accuracy=max(accuracy, 0.001),
-                        duration=monotonic() - stable_since,
-                        sample_count=len(samples),
-                    )
-            else:
-                reference = position
-                stable_since = monotonic()
-                samples = [position]
 
         return None
 
@@ -1272,7 +1193,14 @@ class RTKExtension(Extension):
                     self._allystar_acknowledgements.notify(packet)
                     continue
 
-                accepted = preset.accepts(packet) and self._message_set.accepts(packet)
+                if isinstance(packet, UBXPacket):
+                    self._ubx_acknowledgements.notify(packet)
+
+                accepted = (
+                    self._rtcm_forwarding_enabled
+                    and preset.accepts(packet)
+                    and self._message_set.accepts(packet)
+                )
 
                 self._clock_sync_validator.notify(packet)
                 self._statistics.notify(packet, forwarded=accepted)
@@ -1397,6 +1325,17 @@ class RTKExtension(Extension):
                         id=preset_id,
                         use_configuration_in_title=has_multiple_configurations,
                     )
+                    assist = self._serial_ntrip_assist
+                    if assist.get("source"):
+                        preset.update_from(
+                            {
+                                "base_type": "ublox",
+                                "ntrip_assist": assist["source"],
+                                "ntrip_assist_duration": assist.get("duration", 120),
+                                "ntrip_assist_timeout": assist.get("timeout", 600),
+                                "ntrip_assist_stability": assist.get("stability", 0.05),
+                            }
+                        )
                     to_add.append(preset)
 
         to_remove = [
@@ -1513,7 +1452,7 @@ def get_schema():
                             "title": "NTRIP assist source",
                             "description": (
                                 "Optional NTRIP connection URL used to inject external "
-                                "RTCM corrections into an Allystar base while deriving "
+                                "RTCM corrections into a u-blox USB or Allystar receiver while deriving "
                                 "a stable static position."
                             ),
                             "type": "string",
@@ -1606,6 +1545,37 @@ def get_schema():
             # user to mess with the location of the presets file by default,
             # but it is useful to us in certain deployments. Use it at your
             # own risk.
+            "serial_ntrip_assist": {
+                "type": "object",
+                "title": "Guided survey for detected u-blox USB receivers",
+                "description": (
+                    "Inject NTRIP corrections in rover mode, average fresh RTK-fixed "
+                    "positions, then switch to fixed-coordinate base mode. Applies "
+                    "to automatically detected serial sources."
+                ),
+                "properties": {
+                    "source": {"type": "string", "title": "NTRIP connection URL"},
+                    "duration": {
+                        "type": "number",
+                        "minimum": 1,
+                        "default": 120,
+                        "title": "Minimum stable duration [s]",
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "minimum": 1,
+                        "default": 600,
+                        "title": "Survey timeout [s]",
+                    },
+                    "stability": {
+                        "type": "number",
+                        "minimum": 0.001,
+                        "default": 0.05,
+                        "title": "Maximum ECEF drift [m]",
+                    },
+                },
+                "required": False,
+            },
             "add_serial_ports": {
                 "title": "Use serial ports automatically",
                 "description": (

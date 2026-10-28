@@ -7,6 +7,8 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntFlag
+from math import isfinite
+from struct import unpack_from
 from time import monotonic
 from typing import Deque, Optional
 
@@ -394,12 +396,20 @@ class SurveyStatus:
         self.flags = SurveyStatusFlag.SUPPORTED | SurveyStatusFlag.VALID
         self.accuracy = accuracy
 
-    def set_to_surveying_with_accuracy(
-        self, accuracy: Optional[float] = None
-    ) -> None:
+    def set_to_surveying_with_accuracy(self, accuracy: Optional[float] = None) -> None:
         """Notifies the survey object that the base station is surveying."""
         self.flags = SurveyStatusFlag.SUPPORTED | SurveyStatusFlag.ACTIVE
         self.accuracy = accuracy
+
+
+@dataclass
+class ReceiverPosition:
+    """One receiver solution, with its arrival time and accuracy in meters."""
+
+    position: ECEFCoordinate
+    accuracy: float
+    timestamp: float
+    rtk_fixed: bool = False
 
 
 class RTKStatistics:
@@ -416,6 +426,11 @@ class RTKStatistics:
         self._satellite_count = SatelliteCount()
         self._antenna_information = AntennaInformation()
         self._receiver_position_ecef: Optional[ECEFCoordinate] = None
+        self.receiver_position: Optional[ReceiverPosition] = None
+        self._ubx_pvt: Optional[tuple[int, bool]] = None
+        self._ubx_ecef: Optional[tuple[int, ReceiverPosition]] = None
+        self._ubx_last_fixed_epoch: Optional[int] = None
+        self._guided_survey = False
         self._survey_status = SurveyStatus()
         self.clear()
 
@@ -447,7 +462,30 @@ class RTKStatistics:
         self._satellite_cnrs.clear()
         self._satellite_count.clear()
         self._receiver_position_ecef = None
+        self.clear_receiver_position()
+        self._guided_survey = False
         self._survey_status.clear()
+
+    def clear_receiver_position(self) -> None:
+        """Discard pre-survey solutions, including incomplete UBX epochs."""
+        self.receiver_position = None
+        self._receiver_position_ecef = None
+        self._ubx_pvt = None
+        self._ubx_ecef = None
+        self._ubx_last_fixed_epoch = None
+
+    @contextmanager
+    def guided_survey(self):
+        """Keep RTK-STAT accuracy owned by the server's averaging process."""
+        self.clear_receiver_position()
+        self._guided_survey = True
+        self.set_to_surveying_with_accuracy()
+        try:
+            yield
+        finally:
+            self._guided_survey = False
+            if self._survey_status.active:
+                self._survey_status.clear()
 
     @property
     def json(self):
@@ -497,11 +535,70 @@ class RTKStatistics:
         receiver_position = getattr(packet, "position_ecef", None)
         if receiver_position is not None:
             self._receiver_position_ecef = receiver_position
+            accuracy = getattr(packet, "accuracy", None)
+            if accuracy is not None and isfinite(accuracy) and accuracy >= 0:
+                self.receiver_position = ReceiverPosition(
+                    receiver_position, accuracy, monotonic()
+                )
 
-        if SurveyStatus.is_survey_related_packet(packet) or hasattr(
-            packet, "accuracy"
+        if isinstance(packet, UBXPacket):
+            self._notify_ubx_position(packet)
+
+        if not self._guided_survey and (
+            SurveyStatus.is_survey_related_packet(packet) or hasattr(packet, "accuracy")
         ):
             self._survey_status.notify(packet)  # type: ignore
+
+    def _notify_ubx_position(self, packet: UBXPacket) -> None:
+        """Pair NAV-PVT fix flags with HPPOSECEF from the same GNSS epoch."""
+        if packet.class_id != UBXClass.NAV:
+            return
+        payload = packet.payload
+        if packet.subclass_id == 0x07 and len(payload) >= 92:
+            tow = unpack_from("<I", payload)[0]
+            flags = payload[21]
+            fixed = payload[20] == 3 and flags & 0xC3 == 0x83
+            self._ubx_pvt = (tow, fixed)
+            self._satellite_count.count = payload[23]
+            self._satellite_count._timestamp = monotonic()
+            if not fixed:
+                self.receiver_position = None
+        elif packet.subclass_id == 0x13 and len(payload) == 28:
+            if payload[0] != 0 or payload[23] & 1:
+                self._ubx_ecef = None
+                self.receiver_position = None
+                return
+            tow, x, y, z, hp_x, hp_y, hp_z, _, accuracy = unpack_from(
+                "<IiiibbbBI", payload, 4
+            )
+            if any(abs(hp) > 99 for hp in (hp_x, hp_y, hp_z)):
+                self._ubx_ecef = None
+                self.receiver_position = None
+                return
+            self._ubx_ecef = (
+                tow,
+                ReceiverPosition(
+                    ECEFCoordinate(
+                        x / 100 + hp_x / 10000,
+                        y / 100 + hp_y / 10000,
+                        z / 100 + hp_z / 10000,
+                    ),
+                    accuracy / 10000,
+                    monotonic(),
+                ),
+            )
+        else:
+            return
+
+        if self._ubx_pvt is not None and self._ubx_ecef is not None:
+            tow, fixed = self._ubx_pvt
+            position_tow, solution = self._ubx_ecef
+            if tow == position_tow:
+                solution.rtk_fixed = fixed
+                if fixed and tow != self._ubx_last_fixed_epoch:
+                    self.receiver_position = solution
+                    self._receiver_position_ecef = solution.position
+                    self._ubx_last_fixed_epoch = tow
 
     def set_to_fixed_with_accuracy(self, accuracy: float) -> None:
         """Sets the base station statistics object to fixed mode with the given
@@ -509,9 +606,7 @@ class RTKStatistics:
         """
         self._survey_status.set_to_fixed_with_accuracy(accuracy)
 
-    def set_to_surveying_with_accuracy(
-        self, accuracy: Optional[float] = None
-    ) -> None:
+    def set_to_surveying_with_accuracy(self, accuracy: Optional[float] = None) -> None:
         """Sets the base station statistics object to surveying mode."""
         self._survey_status.set_to_surveying_with_accuracy(accuracy)
 

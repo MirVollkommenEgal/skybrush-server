@@ -1,0 +1,32 @@
+// Guided RTK survey for a u-blox X20/F9 USB receiver (CFG-VALSET required).
+// Select the receiver's USB source in Live after connecting it.
+// Enter your Philipp_BLN credentials in the NTRIP URL below and provide the
+// approximate location for the VRS service. Keep credentials in local config.
+// The receiver is first put into rover mode with RTCM input enabled and base
+// output disabled. After stable RTK-fixed positions have been averaged, the
+// derived ECEF coordinates are loaded and fixed-coordinate base mode is enabled.
+// Live shows the mean receiver accuracy, bounded by the measured position spread.
+// On fix loss the averaging window starts again; timeout/NAK leaves forwarding
+// disabled. No settings are saved to the receiver's nonvolatile memory.
+{
+  "EXTENSIONS": {
+    "rtk": {
+      "enabled": true,
+      "add_serial_ports": [115200],
+      "survey_accuracy": 10,
+      "use_high_precision": true,
+      "serial_ntrip_assist": {
+        "source": "ntrip://username:password@www.sapos-be-ntrip.de:2101/VRS_3_4G_BE",
+        "duration": 60,
+        "timeout": 180,
+        "stability": 0.10
+      }
+    },
+    "location": {
+      "fixed": {
+        "position": [47.0, 19.0, 100.0],
+        "accuracy": 100
+      }
+    }
+  }
+}
